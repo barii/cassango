@@ -1,0 +1,240 @@
+//! HTTP API: the public document API plus the internal node-to-node endpoints.
+
+use crate::coordinator::{FindRequest, Node};
+use crate::gossip::GossipMsg;
+use crate::model::*;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
+use std::sync::Arc;
+
+type AppState = Arc<Node>;
+type ApiResult<T> = Result<T, ApiError>;
+
+pub fn router(node: Arc<Node>) -> Router {
+    Router::new()
+        // public
+        .route("/", get(info))
+        .route("/cluster", get(cluster))
+        .route("/cluster/owners/{c}/{id}", get(owners))
+        .route("/collections", get(local_collections))
+        .route("/collections/{c}/docs", post(insert))
+        .route(
+            "/collections/{c}/docs/{id}",
+            get(get_doc).put(replace_doc).patch(patch_doc).delete(delete_doc),
+        )
+        .route("/collections/{c}/find", post(find))
+        // internal
+        .route("/internal/gossip", post(i_gossip))
+        .route("/internal/apply", post(i_apply))
+        .route("/internal/get", post(i_get))
+        .route("/internal/scan", post(i_scan))
+        .route("/internal/multiget", post(i_multiget))
+        .with_state(node)
+}
+
+// ------------------------------------------------------------------ errors
+
+pub struct ApiError(DbError);
+
+impl From<DbError> for ApiError {
+    fn from(e: DbError) -> Self {
+        ApiError(e)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = match &self.0 {
+            DbError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            DbError::NotFound => StatusCode::NOT_FOUND,
+            DbError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            DbError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            DbError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({ "error": self.0.to_string() }))).into_response()
+    }
+}
+
+fn bad(msg: impl Into<String>) -> ApiError {
+    ApiError(DbError::BadRequest(msg.into()))
+}
+
+// ------------------------------------------------------------------ helpers
+
+#[derive(Deserialize)]
+struct Opts {
+    #[serde(default)]
+    consistency: Consistency,
+}
+
+fn check_collection(c: &str) -> ApiResult<()> {
+    let ok = !c.is_empty()
+        && c.len() <= 128
+        && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if ok { Ok(()) } else { Err(bad("collection names must be 1-128 chars of [A-Za-z0-9_-]")) }
+}
+
+/// Ensure the body is an object and put `_id` first.
+fn with_id(doc: Value, id: &str) -> ApiResult<Value> {
+    let Value::Object(fields) = doc else {
+        return Err(bad("document must be a JSON object"));
+    };
+    let mut out = Map::with_capacity(fields.len() + 1);
+    out.insert("_id".into(), Value::String(id.to_string()));
+    out.extend(fields.into_iter().filter(|(k, _)| k != "_id"));
+    Ok(Value::Object(out))
+}
+
+// ------------------------------------------------------------------ public handlers
+
+async fn info(State(n): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "name": "cassa",
+        "version": env!("CARGO_PKG_VERSION"),
+        "node_id": n.id,
+        "replication_factor": n.rf,
+    }))
+}
+
+async fn cluster(State(n): State<AppState>) -> Json<Value> {
+    let own = n.gossip.ownership();
+    let members: Vec<Value> = n
+        .gossip
+        .members()
+        .into_iter()
+        .map(|s| {
+            json!({
+                "node_id": s.node_id,
+                "addr": s.addr,
+                "status": if n.gossip.is_alive(&s.node_id) { "UP" } else { "DOWN" },
+                "generation": s.generation,
+                "heartbeat": s.heartbeat,
+                "last_seen_secs_ago": n.gossip.seconds_since_seen(&s.node_id),
+                "vnodes": s.tokens.len(),
+                "primary_ownership_pct": own.get(&s.node_id).map(|f| (f * 10000.0).round() / 100.0),
+            })
+        })
+        .collect();
+    Json(json!({
+        "coordinator": n.id,
+        "replication_factor": n.rf,
+        "members": members,
+        "pending_hints": n.hint_counts(),
+    }))
+}
+
+async fn owners(State(n): State<AppState>, Path((c, id)): Path<(String, String)>) -> Json<Value> {
+    let replicas: Vec<Value> = n
+        .replicas_for(&c, &id)
+        .into_iter()
+        .map(|r| json!({ "node_id": r, "alive": n.gossip.is_alive(&r) }))
+        .collect();
+    Json(json!({ "collection": c, "_id": id, "replicas": replicas }))
+}
+
+async fn local_collections(State(n): State<AppState>) -> Json<Value> {
+    Json(json!({ "node_id": n.id, "local_document_counts": n.storage.stats() }))
+}
+
+async fn insert(
+    State(n): State<AppState>,
+    Path(c): Path<String>,
+    Query(o): Query<Opts>,
+    Json(doc): Json<Value>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    check_collection(&c)?;
+    let id = match doc.get("_id") {
+        None | Some(Value::Null) => uuid::Uuid::new_v4().to_string(),
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(Value::Number(num)) => num.to_string(),
+        Some(_) => return Err(bad("_id must be a non-empty string or a number")),
+    };
+    let doc = with_id(doc, &id)?;
+    n.write(&c, &id, Some(doc), o.consistency).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "_id": id }))))
+}
+
+async fn get_doc(
+    State(n): State<AppState>,
+    Path((c, id)): Path<(String, String)>,
+    Query(o): Query<Opts>,
+) -> ApiResult<Json<Value>> {
+    check_collection(&c)?;
+    n.read(&c, &id, o.consistency).await?.map(Json).ok_or(ApiError(DbError::NotFound))
+}
+
+async fn replace_doc(
+    State(n): State<AppState>,
+    Path((c, id)): Path<(String, String)>,
+    Query(o): Query<Opts>,
+    Json(doc): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    check_collection(&c)?;
+    let doc = with_id(doc, &id)?;
+    n.write(&c, &id, Some(doc.clone()), o.consistency).await?;
+    Ok(Json(doc))
+}
+
+async fn patch_doc(
+    State(n): State<AppState>,
+    Path((c, id)): Path<(String, String)>,
+    Query(o): Query<Opts>,
+    Json(update): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    check_collection(&c)?;
+    Ok(Json(n.update(&c, &id, &update, o.consistency).await?))
+}
+
+async fn delete_doc(
+    State(n): State<AppState>,
+    Path((c, id)): Path<(String, String)>,
+    Query(o): Query<Opts>,
+) -> ApiResult<StatusCode> {
+    check_collection(&c)?;
+    n.write(&c, &id, None, o.consistency).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn find(
+    State(n): State<AppState>,
+    Path(c): Path<String>,
+    body: Option<Json<FindRequest>>,
+) -> ApiResult<Json<Value>> {
+    check_collection(&c)?;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let res = n.find(&c, req).await?;
+    Ok(Json(serde_json::to_value(res).map_err(|e| ApiError(DbError::Internal(e.to_string())))?))
+}
+
+// ------------------------------------------------------------------ internal handlers
+
+async fn i_gossip(State(n): State<AppState>, Json(msg): Json<GossipMsg>) -> Json<GossipMsg> {
+    n.gossip.merge(msg.states);
+    Json(n.gossip.message())
+}
+
+async fn i_apply(State(n): State<AppState>, Json(muts): Json<Vec<Mutation>>) -> ApiResult<Json<Value>> {
+    let applied = n
+        .storage
+        .apply_batch(muts)
+        .map_err(|e| ApiError(DbError::Internal(e.to_string())))?;
+    Ok(Json(json!({ "applied": applied })))
+}
+
+async fn i_get(State(n): State<AppState>, Json(r): Json<GetReq>) -> Json<Option<Record>> {
+    Json(n.storage.get(&r.c, &r.k))
+}
+
+async fn i_scan(State(n): State<AppState>, Json(r): Json<ScanReq>) -> ApiResult<Json<Vec<String>>> {
+    crate::query::validate(&r.filter).map_err(bad)?;
+    Ok(Json(n.storage.scan_ids(&r.c, &r.filter)))
+}
+
+async fn i_multiget(State(n): State<AppState>, Json(r): Json<MultigetReq>) -> Json<Vec<(String, Record)>> {
+    Json(n.storage.multiget(&r.c, &r.ids))
+}
