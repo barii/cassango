@@ -101,14 +101,17 @@ pub fn parse_index_key(key: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
 
 // ------------------------------------------------------------------ planning
 
-/// A chosen index and the raw key ranges `[start, end)` to scan in it.
+/// A raw key range `[start, end)`.
+pub type KeyRange = (Vec<u8>, Vec<u8>);
+
+/// A chosen index and the key ranges to scan in it.
 #[derive(Debug, PartialEq)]
 pub struct Plan {
     pub field: String,
-    pub ranges: Vec<(Vec<u8>, Vec<u8>)>,
+    pub ranges: Vec<KeyRange>,
 }
 
-fn eq_range(prefix: &[u8], enc: &str) -> (Vec<u8>, Vec<u8>) {
+fn eq_range(prefix: &[u8], enc: &str) -> KeyRange {
     let mut start = prefix.to_vec();
     start.extend(enc.as_bytes());
     let mut end = start.clone();
@@ -122,7 +125,7 @@ fn is_operator_obj(v: &Value) -> bool {
 }
 
 /// Key ranges for one field condition, plus a cost rank (lower is more selective).
-fn ranges_for(prefix: &[u8], cond: &Value) -> Option<(u8, Vec<(Vec<u8>, Vec<u8>)>)> {
+fn ranges_for(prefix: &[u8], cond: &Value) -> Option<(u8, Vec<KeyRange>)> {
     if !is_operator_obj(cond) {
         // Literal equality. Null means "missing or null", which the index can't see.
         return encode_value(cond).map(|e| (0, vec![eq_range(prefix, &e)]));

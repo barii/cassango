@@ -113,10 +113,11 @@ impl Bloom {
         let mut r = Cursor::new(b);
         let k = r.u32()?;
         let words = r.rest();
-        if words.is_empty() || words.len() % 8 != 0 || k == 0 {
+        if words.is_empty() || !words.len().is_multiple_of(8) || k == 0 {
             return Err(corrupt("bad bloom filter"));
         }
-        let bits = words.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).collect();
+        let (chunks, _) = words.as_chunks::<8>(); // no remainder: length checked above
+        let bits = chunks.iter().map(|c| u64::from_le_bytes(*c)).collect();
         Ok(Bloom { bits, k })
     }
 }
@@ -526,7 +527,7 @@ mod tests {
 
         let all: Vec<Entry> = t.iter_from(b"").map(Result::unwrap).collect();
         assert_eq!(all, data);
-        let tail: Vec<Entry> = t.iter_from(b"users\0004990").map(Result::unwrap).collect();
+        let tail: Vec<Entry> = t.iter_from(b"users\x00004990").map(Result::unwrap).collect();
         assert_eq!(tail, data[4990..]);
         fs::remove_dir_all(dir).unwrap();
     }

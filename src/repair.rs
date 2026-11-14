@@ -171,15 +171,15 @@ pub fn fetch_entries(storage: &Storage, req: &FetchReq) -> io::Result<Vec<Mutati
     let mut out = Vec::new();
     storage.for_each_entry(|key, rec| {
         let token = hash64(key);
-        if let Some(i) = find_range(&ranges, token) {
-            if wanted[i].contains(&ranges[i].leaf(token, leaves)) {
-                let (c, k) = split_key(key);
-                out.push(Mutation {
-                    c: String::from_utf8_lossy(c).into_owned(),
-                    k: String::from_utf8_lossy(k).into_owned(),
-                    r: rec.clone(),
-                });
-            }
+        if let Some(i) = find_range(&ranges, token)
+            && wanted[i].contains(&ranges[i].leaf(token, leaves))
+        {
+            let (c, k) = split_key(key);
+            out.push(Mutation {
+                c: String::from_utf8_lossy(c).into_owned(),
+                k: String::from_utf8_lossy(k).into_owned(),
+                r: rec.clone(),
+            });
         }
     })?;
     Ok(out)

@@ -190,10 +190,10 @@ fn sst_path(dir: &Path, generation: u64) -> PathBuf {
 }
 
 fn keep_newest(best: &mut Option<Record>, cand: Option<&Record>) {
-    if let Some(c) = cand {
-        if best.as_ref().is_none_or(|b| c.supersedes(b)) {
-            *best = Some(c.clone());
-        }
+    if let Some(c) = cand
+        && best.as_ref().is_none_or(|b| c.supersedes(b))
+    {
+        *best = Some(c.clone());
     }
 }
 

@@ -300,10 +300,10 @@ fn add_numbers(cur: &Value, delta: &Value) -> Option<Value> {
         Value::Number(n) => n,
         _ => return None,
     };
-    if let (Some(a), Some(b)) = (cur_n.as_i64(), delta_n.as_i64()) {
-        if let Some(s) = a.checked_add(b) {
-            return Some(Value::from(s));
-        }
+    if let (Some(a), Some(b)) = (cur_n.as_i64(), delta_n.as_i64())
+        && let Some(s) = a.checked_add(b)
+    {
+        return Some(Value::from(s));
     }
     serde_json::Number::from_f64(cur_n.as_f64()? + delta_n.as_f64()?).map(Value::Number)
 }

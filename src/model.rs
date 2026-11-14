@@ -28,7 +28,10 @@ impl Record {
             (None, None) => false,
             (None, Some(_)) => true,
             (Some(_), None) => false,
-            (Some(a), Some(b)) => a.to_string() > b.to_string(),
+            (Some(a), Some(b)) => {
+                let (a, b) = (a.to_string(), b.to_string());
+                a > b
+            }
         }
     }
 
