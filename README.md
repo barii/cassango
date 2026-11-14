@@ -10,7 +10,7 @@ with **MongoDB-style documents and queries**.
 | Replication factor + tunable consistency `one` / `quorum` / `all` | Sort / skip / limit |
 | Last-write-wins timestamps, tombstones, gc_grace | Update operators: `$set $unset $inc $push` |
 | Hinted handoff, read repair, Merkle-tree anti-entropy repair | |
-| Node lifecycle: bootstrap, decommission, removenode, cleanup | |
+| Node lifecycle: bootstrap, decommission, removenode, cleanup | Secondary indexes (equality, `$in`, ranges, multikey arrays) |
 | LSM storage: commit log → memtable → SSTables, bloom filters, size-tiered compaction | |
 
 ## Run a cluster
@@ -58,6 +58,12 @@ curl -XPOST localhost:7003/collections/users/find -d '{
   "sort": {"age": -1}, "skip": 0, "limit": 10
 }'   # -> {"docs": [...], "matched": N, "partial": false}
 
+curl -XPOST localhost:7001/collections/users/indexes -d '{"field":"addr.city"}'   # create index
+curl localhost:7002/collections/users/indexes   # indexes + build state on this node
+curl -XDELETE localhost:7001/collections/users/indexes/addr.city   # drop index
+curl -XPOST localhost:7003/collections/users/find -d '{"filter":{"addr.city":"Leeds"},"explain":true}'
+    # explain: per-node {index, examined, matched}
+
 curl localhost:7001/cluster                     # members, UP/DOWN, ownership, pending hints
 curl localhost:7001/cluster/owners/users/bob    # which nodes hold a key
 curl localhost:7001/collections                 # local doc counts + storage stats (memtable, SSTables)
@@ -81,6 +87,7 @@ src/
   ring.rs         token ring (FNV-1a + splitmix64), vnodes, replica placement, ownership
   coordinator.rs  replicated write/read with consistency levels, hinted handoff,
                   read repair, two-phase scatter/gather find
+  index.rs        index definitions: gossiped schema, persistence, background build/drop
   movement.rs     bootstrap / decommission / removenode / cleanup, range streaming
   repair.rs       Merkle-tree anti-entropy repair (validation, tree diff, streaming), scheduler
   storage/
@@ -88,6 +95,7 @@ src/
     commitlog.rs  segmented write-ahead log with CRC-framed records
     sstable.rs    SSTable format: 4 KiB blocks, sparse index, bloom filter, CRCs
     merge.rs      k-way merge with last-write-wins reconciliation
+    secondary.rs  index key encoding (order-preserving) and query planner
   query.rs        filter matching, validation, sorting, update operators
   api.rs          axum HTTP API (public + /internal/* node-to-node)
 ```
@@ -193,6 +201,37 @@ Decommission and removenode refuse to run while another node is joining or leavi
 Writes to a LEFT node's queue are dropped, and LEFT nodes don't count toward `find`'s
 `partial` flag.
 
+## Secondary indexes
+
+`POST /collections/<c>/indexes {"field": "addr.city"}` defines an index for the whole cluster.
+Indexes are **local**, as in Cassandra: each node indexes only the documents it stores. `find`
+still asks every node, but each node does an index lookup instead of scanning the collection.
+Pass `"explain": true` to see each node's plan.
+
+- **Storage.** Index entries live in the same LSM tree as the documents, under their own key
+  prefix (`\x01 c \0 field \0 value \0 id`). Values are encoded so their byte order matches
+  their value order within a type (numbers via an order-preserving f64 transform, strings
+  escaped), so equality, `$in` and `$gt/$gte/$lt/$lte` become key-range scans. Fields holding
+  arrays get one entry per element, like MongoDB's multikey indexes.
+- **Maintenance is exact.** Every local write to an indexed collection goes through
+  `apply_batch`, whether it comes from a client, a queued write, repair or a node join. There
+  the node reads the document's current winning version. If the incoming write wins, it writes
+  tombstones for the old version's index entries and live entries for the new one, all at the
+  new version's timestamp. A late, older write leaves the index alone. A lock keeps two writes
+  to the same document from interleaving.
+- **Verified.** Every document an index lookup turns up is re-checked against the full filter,
+  so an index can narrow the search but never change the answer.
+- **Planner.** It looks at top-level conditions and those inside a top-level `$and`. It prefers
+  equality, then `$in`, then ranges. Null equality, `$ne`, `$exists`, `$or` and conditions on
+  unindexed fields fall back to a scan. The choice is by rank, not by estimated cost.
+- **Schema.** Index definitions travel in gossip, merged by last-write-wins, and are saved in
+  `schema.json`. A node starts updating a new index on every write right away, backfills
+  existing documents in the background, and only uses the index once that finishes. A node
+  that was down when an index was created builds it after it comes back. A dropped index stops
+  being used at once, and its entries are removed by a compaction.
+- **Local only.** Index entries never appear in repair trees, streams or stats; each node
+  rebuilds its own. Cleanup removes index entries for documents a node no longer owns.
+
 ## Simplifications (vs. the real things)
 
 - Fixed-timeout failure detector instead of phi-accrual. Gossip sends full state, not digests.
@@ -209,7 +248,9 @@ Writes to a LEFT node's queue are dropped, and LEFT nodes don't count toward `fi
   node" shortcut: use removenode, then join a fresh node.
 - A removed node that comes back with its old data dir rejoins as NORMAL with stale data.
   Wipe its data dir first.
-- `find` is a full scatter/gather scan. There are no secondary indexes.
+- `find` still asks every node (indexes are local, not global), and sorting and limits
+  happen on the coordinating node after all matches are gathered. There are no compound
+  indexes and no index-backed sorting.
 - `PATCH` is read-modify-write and not atomic under concurrent updaters (LWW).
 - Inserts are upserts, as in Cassandra. A duplicate `_id` overwrites.
 - Inter-node traffic is plain HTTP/JSON with no auth or TLS.

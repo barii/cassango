@@ -411,7 +411,7 @@ impl Node {
         }
         let (cur, fut, rf, me) = (self.gossip.ring(), self.gossip.future_ring(), self.rf, self.id.clone());
         let keep: KeyFilter = Arc::new(move |key: &[u8]| {
-            let t = hash64(key);
+            let t = hash64(&crate::storage::data_key_for(key)); // index entries follow their document
             cur.replicas(t, rf).contains(&me) || fut.replicas(t, rf).contains(&me)
         });
         let st = self.storage.clone();

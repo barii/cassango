@@ -39,6 +39,7 @@ pub struct Node {
     pub(crate) movement_lock: tokio::sync::Mutex<()>,
     pub(crate) data_dir: std::path::PathBuf,
     pub(crate) ring_delay: Duration,
+    pub indexes: Arc<crate::index::IndexManager>,
 }
 
 #[derive(Deserialize, Default)]
@@ -48,6 +49,9 @@ pub struct FindRequest {
     pub sort: Option<Map<String, Value>>,
     pub skip: Option<usize>,
     pub limit: Option<usize>,
+    /// Include each node's query plan (index used, entries examined) in the result.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Serialize)]
@@ -57,6 +61,8 @@ pub struct FindResult {
     pub matched: usize,
     /// True if some nodes were down or failed, so results may be incomplete.
     pub partial: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explain: Option<BTreeMap<String, Value>>,
 }
 
 impl Node {
@@ -69,6 +75,7 @@ impl Node {
         client: reqwest::Client,
         data_dir: std::path::PathBuf,
         ring_delay: Duration,
+        indexes: Arc<crate::index::IndexManager>,
     ) -> Arc<Self> {
         Arc::new(Node {
             id,
@@ -83,6 +90,7 @@ impl Node {
             movement_lock: tokio::sync::Mutex::new(()),
             data_dir,
             ring_delay,
+            indexes,
         })
     }
 
@@ -146,10 +154,10 @@ impl Node {
         }
     }
 
-    async fn scan_ids(&self, node: &str, c: &str, filter: &Value) -> Result<Vec<String>, String> {
+    async fn scan_ids(&self, node: &str, c: &str, filter: &Value) -> Result<crate::storage::ScanResult, String> {
         if node == self.id {
             let (st, c, f) = (self.storage.clone(), c.to_string(), filter.clone());
-            blocking(move || st.scan_ids(&c, &f)).await
+            blocking(move || st.query_ids(&c, &f)).await
         } else {
             self.rpc(node, "/internal/scan", &ScanReq { c: c.into(), filter: filter.clone() }).await
         }
@@ -372,9 +380,13 @@ impl Node {
 
         let phase1 = futures::future::join_all(nodes.iter().map(|n| self.scan_ids(n, c, &filter))).await;
         let mut candidates = BTreeSet::new();
+        let mut plans = BTreeMap::new();
         for (n, res) in nodes.iter().zip(phase1) {
             match res {
-                Ok(ids) => candidates.extend(ids),
+                Ok(r) => {
+                    plans.insert(n.clone(), serde_json::json!({ "index": r.index, "examined": r.examined, "matched": r.ids.len() }));
+                    candidates.extend(r.ids);
+                }
                 Err(e) => {
                     warn!(node = %n, "scan failed: {e}");
                     partial = true;
@@ -418,6 +430,6 @@ impl Node {
             .skip(req.skip.unwrap_or(0))
             .take(req.limit.unwrap_or(usize::MAX))
             .collect();
-        Ok(FindResult { docs, matched, partial })
+        Ok(FindResult { docs, matched, partial, explain: req.explain.then_some(plans) })
     }
 }

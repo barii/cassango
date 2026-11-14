@@ -7,6 +7,7 @@
 mod api;
 mod coordinator;
 mod gossip;
+mod index;
 mod model;
 mod movement;
 mod query;
@@ -116,6 +117,8 @@ async fn main() -> anyhow::Result<()> {
             fsync: args.fsync,
         },
     )?);
+    let indexes = index::IndexManager::open(&data_dir, storage.clone())?;
+
     // A node that has never finished joining starts as JOINING and bootstraps.
     let bootstrapped = movement::is_bootstrapped(&data_dir);
     if args.no_bootstrap && !bootstrapped {
@@ -132,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(args.gossip_interval_ms),
         Duration::from_millis(args.failure_timeout_ms),
         client.clone(),
+        indexes.clone(),
     );
     let node = coordinator::Node::new(
         args.node_id.clone(),
@@ -141,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         data_dir.clone(),
         Duration::from_millis(args.ring_delay_ms),
+        indexes,
     );
 
     gossiper.spawn();

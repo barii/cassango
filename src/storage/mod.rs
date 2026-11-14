@@ -23,6 +23,7 @@
 
 mod commitlog;
 mod merge;
+pub mod secondary;
 mod sstable;
 
 use crate::model::{now_micros, Mutation, Record};
@@ -34,7 +35,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sstable::{Entry, SsTable};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::Bound;
@@ -100,6 +101,28 @@ enum Job {
 pub struct Storage {
     shared: Arc<Shared>,
     jobs: mpsc::Sender<Job>,
+    /// Secondary indexes maintained on writes: collection -> indexes.
+    indexes: parking_lot::RwLock<HashMap<String, Vec<IndexState>>>,
+    /// Serializes read-current-version + write for indexed collections, so index
+    /// maintenance from concurrent writes to the same document can't interleave.
+    index_write_lock: Mutex<()>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndexState {
+    pub field: String,
+    /// False while the index is being built; maintained on writes but not queried.
+    pub ready: bool,
+}
+
+/// Result of a local query: matching ids plus how they were found.
+#[derive(Serialize, serde::Deserialize, Debug, Default)]
+pub struct ScanResult {
+    pub ids: Vec<String>,
+    /// The index used, or `None` for a full collection scan.
+    pub index: Option<String>,
+    /// Documents (full scan) or index candidates (index scan) examined.
+    pub examined: usize,
 }
 
 #[derive(Serialize)]
@@ -131,6 +154,20 @@ fn encode_key(c: &str, k: &str) -> Vec<u8> {
     key.push(0);
     key.extend(k.as_bytes());
     key
+}
+
+/// The data key whose token decides where an entry lives: the key itself for
+/// documents, or the indexed document's key for index entries.
+pub fn data_key_for(key: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    match secondary::parse_index_key(key) {
+        Some((c, _, id)) => {
+            let mut k = c.to_vec();
+            k.push(0);
+            k.extend(id);
+            std::borrow::Cow::Owned(k)
+        }
+        None => std::borrow::Cow::Borrowed(key),
+    }
 }
 
 pub fn split_key(key: &[u8]) -> (&[u8], &[u8]) {
@@ -247,7 +284,7 @@ impl Storage {
             let s = shared.state.lock();
             info!(dir = %dir.display(), sstables = s.sstables.len(), replayed, "storage opened");
         }
-        Ok(Storage { shared, jobs: tx })
+        Ok(Storage { shared, jobs: tx, indexes: Default::default(), index_write_lock: Mutex::new(()) })
     }
 
     /// Freeze the active memtable, start a new commit log segment, and queue a flush.
@@ -269,8 +306,56 @@ impl Storage {
 
     /// Durably log and apply mutations. Returns the number written.
     pub fn apply_batch(&self, muts: Vec<Mutation>) -> io::Result<usize> {
-        let mut s = self.shared.state.lock();
         let n = muts.len();
+        let indexes = self.indexes.read().clone();
+        let indexed = !indexes.is_empty() && muts.iter().any(|m| indexes.contains_key(&m.c));
+        // Held across reading current versions and writing, see `index_write_lock`.
+        let _guard = indexed.then(|| self.index_write_lock.lock());
+        let muts = if indexed { self.with_index_entries(muts, &indexes)? } else { muts };
+        self.write_raw(muts)?;
+        Ok(n)
+    }
+
+    /// Add index maintenance entries for every mutation that will become the winning
+    /// version of an indexed document: tombstones for the old version's index keys
+    /// and live entries for the new one, all at the new version's timestamp.
+    fn with_index_entries(&self, muts: Vec<Mutation>, indexes: &HashMap<String, Vec<IndexState>>) -> io::Result<Vec<Mutation>> {
+        let mut overlay: HashMap<(String, String), Record> = HashMap::new(); // earlier writes in this batch
+        let mut out = Vec::with_capacity(muts.len() * 2);
+        for m in muts {
+            if let Some(specs) = indexes.get(&m.c).filter(|s| !s.is_empty()) {
+                let key = (m.c.clone(), m.k.clone());
+                let cur = match overlay.get(&key) {
+                    Some(r) => Some(r.clone()),
+                    None => self.get(&m.c, &m.k)?,
+                };
+                if cur.as_ref().is_none_or(|c| m.r.supersedes(c)) {
+                    let keys_of = |r: Option<&Record>, field: &str| -> BTreeSet<String> {
+                        r.and_then(|r| r.value.as_ref())
+                            .map(|v| secondary::index_keys(&m.c, field, v, &m.k))
+                            .unwrap_or_default()
+                    };
+                    for spec in specs {
+                        let old = keys_of(cur.as_ref(), &spec.field);
+                        let new = keys_of(Some(&m.r), &spec.field);
+                        for k in old.difference(&new) {
+                            out.push(Mutation { c: secondary::INDEX_C.into(), k: k.clone(), r: Record { ts: m.r.ts, value: None } });
+                        }
+                        for k in new {
+                            out.push(Mutation { c: secondary::INDEX_C.into(), k, r: Record { ts: m.r.ts, value: Some(Value::Bool(true)) } });
+                        }
+                    }
+                    overlay.insert(key, m.r.clone());
+                }
+            }
+            out.push(m);
+        }
+        Ok(out)
+    }
+
+    /// Log and apply mutations without index maintenance.
+    fn write_raw(&self, muts: Vec<Mutation>) -> io::Result<()> {
+        let mut s = self.shared.state.lock();
         for m in muts {
             let bytes = s.log.append(&m)?;
             s.mem_bytes += bytes + 64; // rough per-entry overhead
@@ -280,7 +365,112 @@ impl Storage {
         if s.mem_bytes >= self.shared.cfg.memtable_bytes {
             self.rotate(&mut s)?;
         }
-        Ok(n)
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ secondary indexes
+
+    /// Start maintaining an index on writes (`ready = false`) or mark it queryable.
+    pub fn set_index(&self, c: &str, field: &str, ready: bool) {
+        let mut idx = self.indexes.write();
+        let list = idx.entry(c.to_string()).or_default();
+        match list.iter_mut().find(|i| i.field == field) {
+            Some(i) => i.ready = ready,
+            None => list.push(IndexState { field: field.to_string(), ready }),
+        }
+    }
+
+    pub fn remove_index(&self, c: &str, field: &str) {
+        let mut idx = self.indexes.write();
+        if let Some(list) = idx.get_mut(c) {
+            list.retain(|i| i.field != field);
+            if list.is_empty() {
+                idx.remove(c);
+            }
+        }
+    }
+
+    pub fn index_state(&self, c: &str, field: &str) -> Option<IndexState> {
+        self.indexes.read().get(c)?.iter().find(|i| i.field == field).cloned()
+    }
+
+    /// Backfill an index from existing documents. Entries carry the document's
+    /// timestamp, so if a concurrent write already replaced a document (and wrote a
+    /// newer tombstone for its old index key), the stale backfill entry loses.
+    pub fn build_index(&self, c: &str, field: &str) -> io::Result<usize> {
+        let (start, end) = collection_range(c);
+        let (mut batch, mut docs) = (Vec::new(), 0usize);
+        for e in self.scan(&start, Some(end))? {
+            let (key, rec) = e?;
+            let Some(v) = &rec.value else { continue };
+            let id = String::from_utf8_lossy(split_key(&key).1).into_owned();
+            for k in secondary::index_keys(c, field, v, &id) {
+                batch.push(Mutation { c: secondary::INDEX_C.into(), k, r: Record { ts: rec.ts, value: Some(Value::Bool(true)) } });
+            }
+            docs += 1;
+            if batch.len() >= 1000 {
+                self.write_raw(std::mem::take(&mut batch))?;
+            }
+        }
+        if !batch.is_empty() {
+            self.write_raw(batch)?;
+        }
+        Ok(docs)
+    }
+
+    /// Physically remove every entry of an index (a cleanup compaction).
+    pub fn purge_index(&self, c: &str, field: &str) -> io::Result<u64> {
+        let prefix = secondary::index_prefix(c, field);
+        self.cleanup(Arc::new(move |k: &[u8]| !k.starts_with(&prefix)))
+    }
+
+    /// Live document ids in `c` matching `filter`, using a ready index when one fits.
+    pub fn query_ids(&self, c: &str, filter: &Value) -> io::Result<ScanResult> {
+        let ready: Vec<String> = self
+            .indexes
+            .read()
+            .get(c)
+            .map(|l| l.iter().filter(|i| i.ready).map(|i| i.field.clone()).collect())
+            .unwrap_or_default();
+        if let Some(plan) = secondary::choose(c, filter, &ready) {
+            let mut seen = HashSet::new();
+            let mut candidates = Vec::new();
+            for (start, end) in &plan.ranges {
+                for e in self.scan(start, Some(end.clone()))? {
+                    let (key, rec) = e?;
+                    if rec.is_tombstone() {
+                        continue;
+                    }
+                    if let Some((_, _, id)) = secondary::parse_index_key(&key) {
+                        let id = String::from_utf8_lossy(id).into_owned();
+                        if seen.insert(id.clone()) {
+                            candidates.push(id);
+                        }
+                    }
+                }
+            }
+            // The index only narrows the search; the full filter decides.
+            let mut ids = Vec::new();
+            for id in &candidates {
+                if self.get(c, id)?.and_then(|r| r.value).is_some_and(|v| query::matches(&v, filter)) {
+                    ids.push(id.clone());
+                }
+            }
+            return Ok(ScanResult { ids, index: Some(plan.field), examined: candidates.len() });
+        }
+
+        let (start, end) = collection_range(c);
+        let mut res = ScanResult::default();
+        for e in self.scan(&start, Some(end))? {
+            let (key, rec) = e?;
+            if let Some(v) = &rec.value {
+                res.examined += 1;
+                if query::matches(v, filter) {
+                    res.ids.push(String::from_utf8_lossy(split_key(&key).1).into_owned());
+                }
+            }
+        }
+        Ok(res)
     }
 
     pub fn get(&self, c: &str, k: &str) -> io::Result<Option<Record>> {
@@ -342,7 +532,10 @@ impl Storage {
     }
 
     /// Visit reconciled entries with key >= `start` in key order until `f` returns false.
+    /// Index entries are local derived data, so they're excluded: repair, streaming and
+    /// stats only ever see documents.
     pub fn scan_from(&self, start: &[u8], mut f: impl FnMut(&[u8], &Record) -> bool) -> io::Result<()> {
+        let start = if start < secondary::DATA_START { secondary::DATA_START } else { start };
         for e in self.scan(start, None)? {
             let (key, rec) = e?;
             if !f(&key, &rec) {
@@ -353,16 +546,9 @@ impl Storage {
     }
 
     /// IDs of live documents in collection `c` matching `filter`.
+    #[cfg(test)]
     pub fn scan_ids(&self, c: &str, filter: &Value) -> io::Result<Vec<String>> {
-        let (start, end) = collection_range(c);
-        let mut out = Vec::new();
-        for e in self.scan(&start, Some(end))? {
-            let (key, rec) = e?;
-            if rec.value.as_ref().is_some_and(|v| query::matches(v, filter)) {
-                out.push(String::from_utf8_lossy(split_key(&key).1).into_owned());
-            }
-        }
-        Ok(out)
+        Ok(self.query_ids(c, filter)?.ids)
     }
 
     /// Local records (including tombstones) for the given ids.
@@ -379,12 +565,12 @@ impl Storage {
     /// Live document count per collection on this node (full scan).
     pub fn stats(&self) -> io::Result<BTreeMap<String, usize>> {
         let mut counts = BTreeMap::new();
-        for e in self.scan(&[], None)? {
-            let (key, rec) = e?;
+        self.scan_from(&[], |key, rec| {
             if !rec.is_tombstone() {
-                *counts.entry(String::from_utf8_lossy(split_key(&key).0).into_owned()).or_default() += 1;
+                *counts.entry(String::from_utf8_lossy(split_key(key).0).into_owned()).or_default() += 1;
             }
-        }
+            true
+        })?;
         Ok(counts)
     }
 
@@ -755,6 +941,76 @@ mod tests {
         assert!(s.get("users", "002").unwrap().is_some());
         s.shutdown().unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Live index entries for `c.field`, as (encoded value suffix, id) strings.
+    fn live_index_entries(s: &Storage, c: &str, field: &str) -> Vec<String> {
+        let prefix = secondary::index_prefix(c, field);
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() = 1;
+        s.scan(&prefix, Some(end))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|(_, r)| !r.is_tombstone())
+            .map(|(k, _)| String::from_utf8_lossy(&k[prefix.len()..]).replace('\0', "|"))
+            .collect()
+    }
+
+    #[test]
+    fn index_maintenance_is_exact_under_updates_deletes_and_reordering() {
+        let dir = tmpdir("index");
+        let s = Storage::open(&dir, cfg(2 * 1024, 3600)).unwrap();
+        let t = now_micros();
+        s.apply_batch(vec![m("pre", t, Some(json!({"city": "York"})))]).unwrap();
+        s.set_index("users", "city", false);
+        assert_eq!(s.build_index("users", "city").unwrap(), 1);
+        s.set_index("users", "city", true);
+
+        s.apply_batch(vec![m("a", t + 1, Some(json!({"city": "Leeds"}))), m("b", t + 1, Some(json!({"city": ["Leeds", "Hull"]})))]).unwrap();
+        s.apply_batch(vec![m("a", t + 5, Some(json!({"city": "York"})))]).unwrap(); // update
+        s.apply_batch(vec![m("a", t + 3, Some(json!({"city": "Bath"})))]).unwrap(); // late, older write: ignored
+        s.apply_batch(vec![m("b", t + 6, None)]).unwrap(); // delete
+        s.apply_batch(vec![m("c", t + 7, Some(json!({"city": "Hull"}))), m("c", t + 8, Some(json!({"city": "Bath"})))]).unwrap(); // same batch
+
+        let mut entries = live_index_entries(&s, "users", "city");
+        entries.sort();
+        let hull = secondary::encode_value(&json!("Bath")).unwrap();
+        let york = secondary::encode_value(&json!("York")).unwrap();
+        assert_eq!(entries, vec![format!("{hull}|c"), format!("{york}|a"), format!("{york}|pre")], "no stale entries");
+
+        let r = s.query_ids("users", &json!({"city": "York"})).unwrap();
+        assert_eq!((r.ids.clone(), r.index.as_deref(), r.examined), (vec!["a".to_string(), "pre".to_string()], Some("city"), 2));
+        assert!(s.query_ids("users", &json!({"city": "Leeds"})).unwrap().ids.is_empty());
+        let full = s.query_ids("users", &json!({"zip": 1})).unwrap();
+        assert_eq!((full.index, full.examined), (None, 3));
+
+        // Index entries never leak into data scans or stats.
+        assert_eq!(s.stats().unwrap().len(), 1);
+        let mut n = 0;
+        s.for_each_entry(|k, _| {
+            assert_ne!(k[0], 1);
+            n += 1;
+        })
+        .unwrap();
+        assert_eq!(n, 4, "pre, a, b (tombstone), c, and no index keys");
+
+        // Survives restart (commit log replay of index mutations).
+        s.shutdown().unwrap();
+        drop(s);
+        let s = Storage::open(&dir, cfg(2 * 1024, 3600)).unwrap();
+        assert_eq!(live_index_entries(&s, "users", "city").len(), 3);
+        assert_eq!(s.purge_index("users", "city").unwrap(), 7, "3 live + 4 tombstones (Leeds|a, Leeds|b, Hull|b, Hull|c)");
+        assert!(live_index_entries(&s, "users", "city").is_empty());
+        s.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn data_key_for_index_entries() {
+        let k = secondary::index_keys("users", "city", &json!({"city": "Leeds"}), "id7").into_iter().next().unwrap();
+        let raw = encode_key(secondary::INDEX_C, &k);
+        assert_eq!(data_key_for(&raw).as_ref(), encode_key("users", "id7").as_slice());
+        assert_eq!(data_key_for(b"users\0x").as_ref(), b"users\0x");
     }
 
     #[test]

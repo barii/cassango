@@ -266,5 +266,73 @@ r=$(curl -s -XPOST $N4/collections/users/find -H 'content-type: application/json
 code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$N1/collections/users/docs/zed?consistency=all" -H 'content-type: application/json' -d '{"n":1}')
 [[ $code == 200 ]] && ok "writes at ALL succeed on the shrunken cluster" || fail "ALL write: $code"
 
+echo "secondary indexes"
+q() {  # q <port> <collection> <find body> <python expr over d>
+  curl -s -XPOST 127.0.0.1:$1/collections/$2/find -H 'content-type: application/json' -d "$3" | j "$4"
+}
+plan='(d["matched"], sorted(set((p["index"], p["examined"]) for p in d["explain"].values())))'
+idx_state() {  # "down" while the node is still starting
+  curl -s 127.0.0.1:$1/collections/$2/indexes 2>/dev/null | j "([i['state'] for i in d['indexes'] if i['field']=='$3'] or ['absent'])[0]" 2>/dev/null || echo down
+}
+wait_index() {  # wait_index <collection> <field> <state> <ports...>
+  local c=$1 f=$2 want=$3; shift 3
+  for p in "$@"; do
+    for _ in $(seq 1 80); do [[ $(idx_state $p $c $f) == $want ]] && break; sleep 0.25; done
+    [[ $(idx_state $p $c $f) == $want ]] || return 1
+  done
+}
+ids_hash() { q $1 bulk "$2" '__import__("hashlib").md5(",".join(x["_id"] for x in d["docs"]).encode()).hexdigest()'; }
+
+body='{"filter":{"bucket":7},"explain":true}'
+before=$(ids_hash 7001 "$body")
+r=$(q 7001 bulk "$body" "$plan")
+[[ $r == "(500, [(None, 5000)])" ]] && ok "without an index every node scans all 5000 docs: $r" || fail "baseline: $r"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPOST $N1/collections/bulk/indexes -H 'content-type: application/json' -d '{"field":"bucket"}')
+[[ $code == 201 ]] && ok "created index bulk.bucket (201)" || fail "create index: $code"
+wait_index bulk bucket ready 7001 7003 7004 && ok "index built on every node (schema spread by gossip)" || fail "index not ready everywhere"
+r=$(q 7003 bulk "$body" "$plan")
+[[ $r == "(500, [('bucket', 500)])" ]] && ok "same query now examines only the 500 matches per node: $r" || fail "indexed: $r"
+[[ $(ids_hash 7003 "$body") == $before ]] && ok "indexed and full-scan results are identical" || fail "result sets differ"
+
+curl -s -XPOST $N1/collections/bulk/indexes -H 'content-type: application/json' -d '{"field":"n"}' >/dev/null
+wait_index bulk n ready 7001 7003 7004 || fail "n index not ready"
+r=$(q 7004 bulk '{"filter":{"n":{"$gte":4990}},"explain":true}' "$plan")
+[[ $r == "(10, [('n', 10)])" ]] && ok "range query via index: $r" || fail "range: $r"
+r=$(q 7001 bulk '{"filter":{"n":{"$gt":4990,"$lt":4995}},"explain":true}' "$plan")
+[[ $r == "(4, [('n', 4)])" ]] && ok "bounded range (4990, 4995): $r" || fail "bounded range: $r"
+r=$(q 7001 bulk '{"filter":{"bucket":{"$in":[1,2]},"n":{"$lt":50}},"explain":true}' "$plan")
+[[ $r == "(10, [('bucket', 1000)])" ]] && ok "two indexed conditions: planner prefers \$in over a range (rank-based, not cost-based): $r" || fail "multi-condition: $r"
+
+curl -s -XPATCH $N1/collections/bulk/docs/d00007 -H 'content-type: application/json' -d '{"$set":{"bucket":3}}' >/dev/null
+curl -s -XDELETE $N3/collections/bulk/docs/d00013 >/dev/null
+r7=$(q 7004 bulk '{"filter":{"bucket":7},"explain":true}' "$plan"); r3=$(q 7004 bulk '{"filter":{"bucket":3},"explain":true}' "$plan")
+[[ $r7 == "(499, [('bucket', 499)])" && $r3 == "(500, [('bucket', 500)])" ]] \
+  && ok "index follows updates and deletes exactly, no stale entries (7: $r7, 3: $r3)" || fail "maintenance: 7=$r7 3=$r3"
+
+# An index created while a node is down is built when it comes back.
+$C kill 4 >/dev/null
+for _ in $(seq 1 40); do
+  st=$(curl -s $N1/cluster | j "[m['status'] for m in d['members'] if m['node_id']=='node4'][0]"); [[ $st == DOWN ]] && break; sleep 0.25
+done
+curl -s -XPOST $N1/collections/during_join/indexes -H 'content-type: application/json' -d '{"field":"i"}' >/dev/null
+wait_index during_join i ready 7001 7003 || fail "during_join.i not ready on live nodes"
+$C restart 4 >/dev/null
+wait_index during_join i ready 7004 && ok "node4 was down at creation; built the index after rejoining" || fail "node4 never built during_join.i"
+[[ $(grep -c 'building index.*field=.*bucket\|building index.*bucket' logs/node4.log) == 1 && $(idx_state 7004 bulk bucket) == ready ]] \
+  && ok "existing indexes survived node4's restart without a rebuild" || fail "bucket index rebuilt or not ready on node4"
+for _ in $(seq 1 60); do converged3=1; for p in 7001 7003 7004; do
+  up=$(curl -s 127.0.0.1:$p/cluster | j "sum(m['status']=='UP' for m in d['members'] if m['state']=='NORMAL')"); [[ $up == 3 ]] || converged3=0; done
+  [[ $converged3 == 1 ]] && break; sleep 0.25; done
+r=$(q 7004 during_join '{"filter":{"i":{"$lt":10}},"explain":true}' "$plan")
+[[ $r == "(10, [('i', 10)])" ]] && ok "query on the new index across all nodes: $r" || fail "during_join.i: $r"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' -XDELETE $N3/collections/bulk/indexes/bucket)
+[[ $code == 204 ]] && ok "dropped index bulk.bucket" || fail "drop: $code"
+wait_index bulk bucket absent 7001 7003 7004 || fail "drop did not spread"
+r=$(q 7001 bulk '{"filter":{"bucket":7},"explain":true}' "$plan")
+[[ $r == "(499, [(None, 4999)])" ]] && ok "after drop, queries fall back to scanning: $r" || fail "after drop: $r"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XDELETE $N3/collections/bulk/indexes/bucket)
+[[ $code == 404 ]] && ok "dropping again is 404" || fail "second drop: $code"
+
 echo
 echo "all $pass checks passed"

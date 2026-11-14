@@ -7,7 +7,7 @@ use crate::storage::blocking;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -29,6 +29,8 @@ pub fn router(node: Arc<Node>) -> Router {
             get(get_doc).put(replace_doc).patch(patch_doc).delete(delete_doc),
         )
         .route("/collections/{c}/find", post(find))
+        .route("/collections/{c}/indexes", post(create_index).get(list_indexes))
+        .route("/collections/{c}/indexes/{field}", delete(drop_index))
         .route("/admin/compact", post(admin_compact))
         .route("/admin/repair", post(admin_repair).get(last_repair))
         .route("/admin/decommission", post(admin_decommission))
@@ -281,6 +283,34 @@ async fn last_repair(State(n): State<AppState>) -> Json<Value> {
     Json(json!({ "node_id": n.id, "last_repair": *n.last_repair.lock() }))
 }
 
+#[derive(Deserialize)]
+struct CreateIndex {
+    field: String,
+}
+
+/// Define a secondary index cluster-wide. Every node builds it locally in the background.
+async fn create_index(
+    State(n): State<AppState>,
+    Path(c): Path<String>,
+    Json(body): Json<CreateIndex>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    check_collection(&c)?;
+    let (def, created) = n.indexes.create(&c, &body.field).map_err(bad)?;
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(json!({ "collection": def.collection, "field": def.field, "created_ts": def.ts }))))
+}
+
+/// Indexes on a collection and whether each is ready on *this* node.
+async fn list_indexes(State(n): State<AppState>, Path(c): Path<String>) -> ApiResult<Json<Value>> {
+    check_collection(&c)?;
+    Ok(Json(json!({ "node_id": n.id, "collection": c, "indexes": n.indexes.list(&c) })))
+}
+
+async fn drop_index(State(n): State<AppState>, Path((c, field)): Path<(String, String)>) -> ApiResult<StatusCode> {
+    check_collection(&c)?;
+    if n.indexes.drop_index(&c, &field) { Ok(StatusCode::NO_CONTENT) } else { Err(ApiError(DbError::NotFound)) }
+}
+
 // ------------------------------------------------------------------ internal handlers
 
 async fn i_stream(
@@ -310,7 +340,7 @@ async fn i_repair_fetch(State(n): State<AppState>, Json(r): Json<crate::repair::
 }
 
 async fn i_gossip(State(n): State<AppState>, Json(msg): Json<GossipMsg>) -> Json<GossipMsg> {
-    n.gossip.merge(msg.states);
+    n.gossip.merge_msg(msg);
     Json(n.gossip.message())
 }
 
@@ -325,10 +355,10 @@ async fn i_get(State(n): State<AppState>, Json(r): Json<GetReq>) -> ApiResult<Js
     Ok(Json(blocking(move || st.get(&r.c, &r.k)).await.map_err(internal)?))
 }
 
-async fn i_scan(State(n): State<AppState>, Json(r): Json<ScanReq>) -> ApiResult<Json<Vec<String>>> {
+async fn i_scan(State(n): State<AppState>, Json(r): Json<ScanReq>) -> ApiResult<Json<crate::storage::ScanResult>> {
     crate::query::validate(&r.filter).map_err(bad)?;
     let st = n.storage.clone();
-    Ok(Json(blocking(move || st.scan_ids(&r.c, &r.filter)).await.map_err(internal)?))
+    Ok(Json(blocking(move || st.query_ids(&r.c, &r.filter)).await.map_err(internal)?))
 }
 
 async fn i_multiget(State(n): State<AppState>, Json(r): Json<MultigetReq>) -> ApiResult<Json<Vec<(String, Record)>>> {

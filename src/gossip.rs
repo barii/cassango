@@ -22,6 +22,7 @@
 //! seen its heartbeat advance (directly or second-hand) within `failure_timeout`.
 //! (Cassandra uses a phi-accrual detector; a fixed timeout keeps this readable.)
 
+use crate::index::{IndexDef, IndexManager};
 use crate::model::rand_below;
 use crate::ring::{self, Ring};
 use parking_lot::{Mutex, RwLock};
@@ -70,6 +71,9 @@ impl EndpointState {
 pub struct GossipMsg {
     pub from: String,
     pub states: Vec<EndpointState>,
+    /// Cluster-wide secondary index definitions, merged last-write-wins.
+    #[serde(default)]
+    pub schema: Vec<IndexDef>,
 }
 
 pub struct Gossiper {
@@ -86,6 +90,7 @@ pub struct Gossiper {
     /// Last reported liveness, used only to log UP/DOWN transitions.
     reported: Mutex<HashMap<String, bool>>,
     client: reqwest::Client,
+    schema: Arc<IndexManager>,
 }
 
 impl Gossiper {
@@ -99,6 +104,7 @@ impl Gossiper {
         interval: Duration,
         failure_timeout: Duration,
         client: reqwest::Client,
+        schema: Arc<IndexManager>,
     ) -> Arc<Self> {
         let generation = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let me = EndpointState {
@@ -122,6 +128,7 @@ impl Gossiper {
             future_ring: RwLock::new(Arc::new(Ring::default())),
             reported: Mutex::new(HashMap::new()),
             client,
+            schema,
         });
         g.rebuild_rings();
         g
@@ -201,6 +208,7 @@ impl Gossiper {
         GossipMsg {
             from: self.self_id.clone(),
             states: self.states.read().values().cloned().collect(),
+            schema: self.schema.defs(),
         }
     }
 
@@ -223,6 +231,12 @@ impl Gossiper {
         }
         self.rebuild_rings();
         true
+    }
+
+    /// Merge a gossip message: node states and the index schema.
+    pub fn merge_msg(&self, msg: GossipMsg) {
+        self.schema.merge(msg.schema);
+        self.merge(msg.states);
     }
 
     /// Merge remote states into ours, keeping the newest version of each.
@@ -355,7 +369,7 @@ impl Gossiper {
             .and_then(|r| r.error_for_status());
         match res {
             Ok(resp) => match resp.json::<GossipMsg>().await {
-                Ok(msg) => self.merge(msg.states),
+                Ok(msg) => self.merge_msg(msg),
                 Err(e) => debug!(%addr, "bad gossip reply: {e}"),
             },
             Err(e) => debug!(%addr, "gossip failed: {e}"),
