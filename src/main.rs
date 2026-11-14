@@ -9,6 +9,7 @@ mod coordinator;
 mod gossip;
 mod model;
 mod query;
+mod repair;
 mod ring;
 mod storage;
 
@@ -68,6 +69,11 @@ struct Args {
     #[arg(long, default_value_t = 864_000)]
     gc_grace_secs: u64,
 
+    /// Run anti-entropy repair of this node's primary ranges every N seconds
+    /// (0 = only on demand via POST /admin/repair). Keep it below --gc-grace-secs.
+    #[arg(long, default_value_t = 0)]
+    repair_interval_secs: u64,
+
     /// fsync the commit log after every write batch (durable but slower).
     #[arg(long)]
     fsync: bool,
@@ -117,6 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     gossiper.spawn();
     node.spawn_hint_replayer();
+    node.spawn_repair_scheduler(args.repair_interval_secs);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(node = %args.node_id, listen = %args.listen, advertise = %advertise, seeds = ?args.seeds,

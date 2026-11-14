@@ -6,6 +6,7 @@
 #   scripts/cluster.sh kill <i>      hard-kill node i (1-based)
 #   scripts/cluster.sh restart <i>   start node i again
 #   scripts/cluster.sh status        show cluster view from node 1
+#   scripts/cluster.sh repair        run anti-entropy repair on every running node
 #   scripts/cluster.sh clean         stop and delete data/ and logs/
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -49,7 +50,12 @@ case "${1:-}" in
     for p in ${pids[@]+"${pids[@]}"}; do while kill -0 "$p" 2>/dev/null; do sleep 0.1; done; done ;;
   kill)    stop_node "$2" KILL ;;
   restart) start_node "$2" ;;
+  repair)
+    for f in logs/node*.pid; do
+      [[ -e $f ]] || continue; i=${f#logs/node}; i=${i%.pid}
+      echo "node$i: $(curl -s -XPOST "127.0.0.1:$((BASE_PORT + i))/admin/repair" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("ranges={ranges} in_sync={ranges_in_sync} repaired={ranges_repaired} skipped={ranges_skipped} streamed={total} {duration_ms}ms errors={errors}".format(total=sum(d["streamed"].values()), **d))')"
+    done ;;
   status)  curl -s "127.0.0.1:$((BASE_PORT + ${2:-1}))/cluster" | python3 -m json.tool ;;
   clean)   "$0" stop; rm -rf data logs ;;
-  *) sed -n '2,10p' "$0"; exit 1 ;;
+  *) sed -n '2,11p' "$0"; exit 1 ;;
 esac

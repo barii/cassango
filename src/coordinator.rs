@@ -34,6 +34,8 @@ pub struct Node {
     hints: Mutex<HashMap<String, Vec<Mutation>>>,
     client: reqwest::Client,
     clock: AtomicU64,
+    pub(crate) repair_lock: tokio::sync::Mutex<()>,
+    pub(crate) last_repair: Mutex<Option<crate::repair::RepairReport>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -64,6 +66,8 @@ impl Node {
             hints: Mutex::new(HashMap::new()),
             client,
             clock: AtomicU64::new(0),
+            repair_lock: tokio::sync::Mutex::new(()),
+            last_repair: Mutex::new(None),
         })
     }
 
@@ -84,7 +88,7 @@ impl Node {
 
     // ------------------------------------------------------------ RPC plumbing
 
-    async fn rpc<B: Serialize, R: DeserializeOwned>(&self, node: &str, path: &str, body: &B) -> Result<R, String> {
+    pub(crate) async fn rpc<B: Serialize, R: DeserializeOwned>(&self, node: &str, path: &str, body: &B) -> Result<R, String> {
         let addr = self.gossip.addr_of(node).ok_or_else(|| format!("unknown node {node}"))?;
         let resp = self
             .client
@@ -97,7 +101,7 @@ impl Node {
         resp.json::<R>().await.map_err(|e| e.to_string())
     }
 
-    async fn send_mutations(&self, node: &str, muts: Vec<Mutation>) -> Result<(), String> {
+    pub(crate) async fn send_mutations(&self, node: &str, muts: Vec<Mutation>) -> Result<(), String> {
         if node == self.id {
             let st = self.storage.clone();
             blocking(move || st.apply_batch(muts)).await.map(|_| ())

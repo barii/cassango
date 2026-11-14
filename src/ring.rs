@@ -1,6 +1,38 @@
 //! Consistent-hash token ring with virtual nodes (Cassandra-style partitioning).
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+/// A token range `(start, end]`, possibly wrapping around the end of the ring.
+/// `start == end` means the whole ring.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl TokenRange {
+    fn span(&self) -> u128 {
+        match self.end.wrapping_sub(self.start) {
+            0 => 1u128 << 64,
+            s => s as u128,
+        }
+    }
+
+    /// Position of `token` within the range, 0-based; only meaningful if contained.
+    fn offset(&self, token: u64) -> u128 {
+        token.wrapping_sub(self.start).wrapping_sub(1) as u128
+    }
+
+    pub fn contains(&self, token: u64) -> bool {
+        self.offset(token) < self.span()
+    }
+
+    /// Which of `leaves` equal-width sub-ranges `token` falls into.
+    pub fn leaf(&self, token: u64, leaves: usize) -> usize {
+        (self.offset(token) * leaves as u128 / self.span()) as usize
+    }
+}
 
 /// 64-bit FNV-1a followed by a splitmix64 finalizer for good avalanche.
 /// Must be stable across processes and versions, so we don't use std's hasher.
@@ -67,6 +99,15 @@ impl Ring {
         out
     }
 
+    /// Ranges for which `node` is the primary owner: `(previous token, node's token]`.
+    pub fn primary_ranges(&self, node: &str) -> Vec<TokenRange> {
+        let len = self.tokens.len();
+        (0..len)
+            .filter(|i| self.tokens[*i].1 == node)
+            .map(|i| TokenRange { start: self.tokens[(i + len - 1) % len].0, end: self.tokens[i].0 })
+            .collect()
+    }
+
     /// Fraction of the token space for which each node is the primary owner.
     pub fn ownership(&self) -> BTreeMap<String, f64> {
         let mut own: HashMap<&str, f64> = HashMap::new();
@@ -120,6 +161,33 @@ mod tests {
         for v in own.values() {
             assert!(*v > 0.1 && *v < 0.45, "unbalanced: {own:?}");
         }
+    }
+
+    #[test]
+    fn primary_ranges_partition_the_ring() {
+        let r = ring(3);
+        let ranges: Vec<(String, TokenRange)> = (0..3)
+            .flat_map(|i| r.primary_ranges(&format!("node{i}")).into_iter().map(move |t| (format!("node{i}"), t)))
+            .collect();
+        assert_eq!(ranges.len(), 48);
+        for k in 0..500 {
+            let t = key_token("c", &k.to_string());
+            let owners: Vec<&String> = ranges.iter().filter(|(_, rg)| rg.contains(t)).map(|(n, _)| n).collect();
+            assert_eq!(owners.len(), 1, "each token in exactly one range");
+            assert_eq!(*owners[0], r.replicas(t, 1)[0], "range owner is the primary replica");
+        }
+    }
+
+    #[test]
+    fn token_range_wraps_and_leaves() {
+        let wrap = TokenRange { start: u64::MAX - 10, end: 10 };
+        assert!(wrap.contains(u64::MAX) && wrap.contains(0) && wrap.contains(10));
+        assert!(!wrap.contains(11) && !wrap.contains(u64::MAX - 10));
+        assert_eq!(wrap.leaf(u64::MAX - 9, 4), 0);
+        assert_eq!(wrap.leaf(10, 4), 3);
+        let full = TokenRange { start: 5, end: 5 };
+        assert!(full.contains(5) && full.contains(0));
+        assert!(full.leaf(4, 1024) < 1024);
     }
 
     #[test]

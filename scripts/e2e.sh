@@ -15,11 +15,14 @@ trap '$C stop >/dev/null 2>&1 || true' EXIT
 $C clean >/dev/null 2>&1 || true
 $C start 4
 echo "waiting for gossip to converge..."
-for _ in $(seq 1 40); do
-  up=$(curl -s $N4/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
-  [[ $up == 4 ]] && break; sleep 0.25
-done
-[[ $up == 4 ]] && ok "all 4 nodes see each other via gossip" || fail "gossip did not converge ($up/4)"
+converged() {  # every node sees all 4 nodes UP
+  for n in $N1 $N2 $N3 $N4; do
+    up=$(curl -s $n/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
+    [[ $up == 4 ]] || return 1
+  done
+}
+for _ in $(seq 1 60); do converged && break; sleep 0.25; done
+converged && ok "all 4 nodes see each other via gossip" || fail "gossip did not converge ($up/4)"
 
 echo "documents"
 id=$(curl -s -XPOST $N1/collections/users/docs -d '{"name":"ann","age":31,"tags":["admin"],"addr":{"city":"Leeds"}}' -H 'content-type: application/json' | j "d['_id']")
@@ -109,10 +112,7 @@ r=$(curl -s -XPOST $N3/collections/bulk/find -H 'content-type: application/json'
 $C stop >/dev/null
 [[ $(ls data/node*/commitlog-*.log | xargs cat | wc -c | tr -d ' ') == 0 ]] && ok "graceful stop flushed memtables (commit logs empty)" || fail "commit logs not empty after shutdown"
 $C start 4 >/dev/null
-for _ in $(seq 1 40); do
-  up=$(curl -s $N1/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
-  [[ $up == 4 ]] && break; sleep 0.25
-done
+for _ in $(seq 1 60); do converged && break; sleep 0.25; done
 r=$(curl -s -XPOST $N2/collections/bulk/find -H 'content-type: application/json' -d '{"filter":{},"limit":0}' | j "d['matched']")
 [[ $r == 5000 ]] && ok "full cluster restart: all 5000 docs read back from disk" || fail "after restart matched=$r"
 r=$(curl -s $N4/collections/users/docs/dan | j "d['age']")
@@ -123,6 +123,56 @@ per_node=$(for i in 1 2 3 4; do ls data/node$i/sst-*.db | wc -l | tr -d ' '; don
 [[ $per_node == "1 " ]] && ok "major compaction: exactly 1 SSTable per node" || fail "sstables per node after major compaction: $per_node"
 r=$(curl -s -XPOST $N1/collections/bulk/find -H 'content-type: application/json' -d '{"filter":{"bucket":7}}' | j "d['matched']")
 [[ $r == 500 ]] && ok "data intact after compaction (bucket 7: $r docs)" || fail "after compaction: $r"
+
+echo "anti-entropy repair"
+replicas_of() { curl -s $N1/cluster/owners/$1/$2 | j "' '.join(r['node_id'][4:] for r in d['replicas'])"; }
+state_on() {  # live | tomb | none
+  curl -s -XPOST 127.0.0.1:700$1/internal/get -H 'content-type: application/json' -d "{\"c\":\"$2\",\"k\":\"$3\"}" \
+    | j "'none' if d is None else ('tomb' if d['v'] is None else 'live')"
+}
+states() { for i in $(replicas_of $1 $2); do state_on $i $1 $2; done | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}'; }
+now() { python3 -c "import time; print(int(time.time()*1e6))"; }
+
+# (a) Writes that reached only one replica, as if their hints were lost.
+# (never inject onto node3: it's about to lose its disk, which would erase the evidence)
+r1=$(replicas_of users eve | tr ' ' '\n' | grep -v '^3$' | head -1)
+curl -s -XPOST 127.0.0.1:700$r1/internal/apply -H 'content-type: application/json' \
+     -d "[{\"c\":\"users\",\"k\":\"eve\",\"r\":{\"ts\":$(now),\"v\":{\"_id\":\"eve\",\"name\":\"eve\"}}}]" >/dev/null
+r2=$(replicas_of users $id | tr ' ' '\n' | grep -v '^3$' | tail -1)
+curl -s -XPOST 127.0.0.1:700$r2/internal/apply -H 'content-type: application/json' \
+     -d "[{\"c\":\"users\",\"k\":\"$id\",\"r\":{\"ts\":$(now),\"v\":null}}]" >/dev/null
+s1=$(states users eve); s2=$(states users $id)
+[[ $s1 == "live:1 none:2 " && $s2 == "live:2 tomb:1 " ]] && ok "injected divergence: eve [$s1] ann [$s2]" || fail "setup: eve [$s1] ann [$s2]"
+
+# (b) A node loses its disk.
+before=$(curl -s $N3/collections | j "d['local_document_counts'].get('bulk',0)")
+$C kill 3 >/dev/null; rm -rf data/node3; $C restart 3 >/dev/null
+for _ in $(seq 1 60); do
+  up=$(curl -s $N3/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
+  seen=$(curl -s $N1/cluster | j "[m['status'] for m in d['members'] if m['node_id']=='node3'][0]")
+  [[ $up == 4 && $seen == UP ]] && break; sleep 0.25
+done
+after=$(curl -s $N3/collections | j "d['local_document_counts'].get('bulk',0)")
+[[ $after == 0 && $before -gt 0 ]] && ok "node3 lost its disk: $before bulk docs -> $after" || fail "wipe: $before -> $after"
+
+$C repair | sed 's/^/    /'
+fixed=$(curl -s $N3/collections | j "d['local_document_counts'].get('bulk',0)")
+[[ $fixed == $before ]] && ok "repair rebuilt node3 from its peers ($fixed/$before docs)" || fail "node3 has $fixed/$before after repair"
+s1=$(states users eve); s2=$(states users $id)
+[[ $s1 == "live:3 " ]] && ok "lost write propagated to all replicas [$s1]" || fail "eve after repair: [$s1]"
+[[ $s2 == "tomb:3 " ]] && ok "lost delete propagated to all replicas [$s2]" || fail "ann after repair: [$s2]"
+streamed=$(for i in 1 2 3 4; do curl -s -XPOST 127.0.0.1:700$i/admin/repair | j "sum(d['streamed'].values())"; done | paste -sd+ - | bc)
+[[ $streamed == 0 ]] && ok "second repair: every range in sync, nothing streamed" || fail "second repair streamed $streamed"
+code=$(curl -s -o /dev/null -w '%{http_code}' $N1/collections/users/docs/eve)
+[[ $code == 200 ]] && ok "eve readable through the normal API" || fail "eve: $code"
+
+$C kill 4 >/dev/null
+for _ in $(seq 1 40); do
+  st=$(curl -s $N1/cluster | j "[m['status'] for m in d['members'] if m['node_id']=='node4'][0]")
+  [[ $st == DOWN ]] && break; sleep 0.25
+done
+r=$(curl -s -XPOST $N1/admin/repair | j "(d['ranges_skipped'] > 0, d['ranges_skipped'] + d['ranges_in_sync'] == d['ranges'], len(d['errors']) > 0)")
+[[ $r == "(True, True, True)" ]] && ok "repair with a replica down skips its ranges and reports why" || fail "repair with node down: $r"
 
 echo
 echo "all $pass checks passed"

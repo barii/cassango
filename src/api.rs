@@ -30,6 +30,9 @@ pub fn router(node: Arc<Node>) -> Router {
         )
         .route("/collections/{c}/find", post(find))
         .route("/admin/compact", post(admin_compact))
+        .route("/admin/repair", post(admin_repair).get(last_repair))
+        .route("/internal/repair/trees", post(i_repair_trees))
+        .route("/internal/repair/fetch", post(i_repair_fetch))
         // internal
         .route("/internal/gossip", post(i_gossip))
         .route("/internal/apply", post(i_apply))
@@ -56,6 +59,7 @@ impl IntoResponse for ApiError {
             DbError::NotFound => StatusCode::NOT_FOUND,
             DbError::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             DbError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+            DbError::Conflict(_) => StatusCode::CONFLICT,
             DbError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({ "error": self.0.to_string() }))).into_response()
@@ -236,7 +240,36 @@ async fn find(
     Ok(Json(serde_json::to_value(res).map_err(|e| ApiError(DbError::Internal(e.to_string())))?))
 }
 
+#[derive(Deserialize)]
+struct RepairOpts {
+    depth: Option<u32>,
+}
+
+/// Run an anti-entropy repair of this node's primary ranges and return the report.
+async fn admin_repair(State(n): State<AppState>, Query(o): Query<RepairOpts>) -> ApiResult<Json<Value>> {
+    let report = n.repair(o.depth.unwrap_or(crate::repair::DEFAULT_DEPTH)).await?;
+    Ok(Json(serde_json::to_value(report).map_err(|e| internal(e.to_string()))?))
+}
+
+async fn last_repair(State(n): State<AppState>) -> Json<Value> {
+    Json(json!({ "node_id": n.id, "last_repair": *n.last_repair.lock() }))
+}
+
 // ------------------------------------------------------------------ internal handlers
+
+async fn i_repair_trees(
+    State(n): State<AppState>,
+    Json(r): Json<crate::repair::TreesReq>,
+) -> ApiResult<Json<Vec<crate::repair::MerkleTree>>> {
+    let st = n.storage.clone();
+    let trees = blocking(move || crate::repair::build_trees(&st, &r.ranges, r.depth)).await.map_err(internal)?;
+    Ok(Json(trees))
+}
+
+async fn i_repair_fetch(State(n): State<AppState>, Json(r): Json<crate::repair::FetchReq>) -> ApiResult<Json<Vec<Mutation>>> {
+    let st = n.storage.clone();
+    Ok(Json(blocking(move || crate::repair::fetch_entries(&st, &r)).await.map_err(internal)?))
+}
 
 async fn i_gossip(State(n): State<AppState>, Json(msg): Json<GossipMsg>) -> Json<GossipMsg> {
     n.gossip.merge(msg.states);

@@ -129,7 +129,7 @@ fn encode_key(c: &str, k: &str) -> Vec<u8> {
     key
 }
 
-fn split_key(key: &[u8]) -> (&[u8], &[u8]) {
+pub fn split_key(key: &[u8]) -> (&[u8], &[u8]) {
     match key.iter().position(|b| *b == 0) {
         Some(i) => (&key[..i], &key[i + 1..]),
         None => (key, &[]),
@@ -326,6 +326,16 @@ impl Storage {
             sources.push(Box::new(t.iter_from(start)));
         }
         Merge::new(sources, end)
+    }
+
+    /// Visit every reconciled entry on this node (tombstones included) in key order.
+    /// Keys are composite `collection \0 id`, so `ring::hash64(key)` is the token.
+    pub fn for_each_entry(&self, mut f: impl FnMut(&[u8], &Record)) -> io::Result<()> {
+        for e in self.scan(&[], None)? {
+            let (key, rec) = e?;
+            f(&key, &rec);
+        }
+        Ok(())
     }
 
     /// IDs of live documents in collection `c` matching `filter`.

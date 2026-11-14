@@ -9,7 +9,7 @@ with **MongoDB-style documents and queries**.
 | Consistent-hash ring with vnodes, masterless (any node coordinates) | Query filters: `$eq $ne $gt $gte $lt $lte $in $nin $exists $size $not $and $or $nor`, dotted paths, array matching |
 | Replication factor + tunable consistency `one` / `quorum` / `all` | Sort / skip / limit |
 | Last-write-wins timestamps, tombstones, gc_grace | Update operators: `$set $unset $inc $push` |
-| Hinted handoff, read repair | |
+| Hinted handoff, read repair, Merkle-tree anti-entropy repair | |
 | LSM storage: commit log → memtable → SSTables, bloom filters, size-tiered compaction | |
 
 ## Run a cluster
@@ -19,6 +19,7 @@ scripts/cluster.sh start 3      # nodes on 127.0.0.1:7001..7003, RF=3
 scripts/cluster.sh status       # gossip view
 scripts/cluster.sh kill 2       # hard-kill node2
 scripts/cluster.sh restart 2
+scripts/cluster.sh repair       # anti-entropy repair on every node
 scripts/cluster.sh clean        # stop + wipe data/ logs/
 scripts/e2e.sh                  # full end-to-end test (4 nodes, failure + recovery)
 ```
@@ -56,6 +57,8 @@ curl localhost:7001/cluster                     # members, UP/DOWN, ownership, p
 curl localhost:7001/cluster/owners/users/bob    # which nodes hold a key
 curl localhost:7001/collections                 # local doc counts + storage stats (memtable, SSTables)
 curl -XPOST 'localhost:7001/admin/compact?major=true'   # flush + compact this node
+curl -XPOST localhost:7001/admin/repair         # repair this node's primary ranges -> report
+curl localhost:7001/admin/repair                # last repair report
 ```
 
 Errors: `400` bad request, `404` not found, `503` not enough live replicas
@@ -70,6 +73,7 @@ src/
   ring.rs         token ring (FNV-1a + splitmix64), vnodes, replica placement, ownership
   coordinator.rs  replicated write/read with consistency levels, hinted handoff,
                   read repair, two-phase scatter/gather find
+  repair.rs       Merkle-tree anti-entropy repair (validation, tree diff, streaming), scheduler
   storage/
     mod.rs        LSM engine: memtable, flush/compaction worker, reads & scans
     commitlog.rs  segmented write-ahead log with CRC-framed records
@@ -121,14 +125,42 @@ write ─► commit log segment ─► memtable ──(> --memtable-mb)──►
 - **Graceful shutdown** (SIGINT) flushes the memtable. After a crash, the commit log is
   replayed on startup.
 
+## Anti-entropy repair
+
+Hinted handoff and read repair fix most divergence, but not all of it. Hints are lost when a
+coordinator restarts, read repair only touches keys that get read, and a node can lose its
+disk. `POST /admin/repair`, or `--repair-interval-secs N` for scheduled runs, repairs this
+node's **primary** token ranges, like `nodetool repair -pr`. Run it on every node to cover the
+whole ring:
+
+1. **Validation.** Every replica of those ranges builds one Merkle tree per range in a single
+   scan of its local data. Each range is split into 2^`depth` leaves (default 1024) by token.
+   A leaf's hash is the XOR of its `(key, timestamp, value)` entry hashes, so it doesn't depend
+   on order. Inner nodes hash their children.
+2. **Comparison.** Each replica's trees are compared with this node's from the root down, so
+   only differing leaves come out.
+3. **Streaming.** All replicas' entries in those leaves (tombstones included) are fetched. The
+   newest version of each key is chosen by last-write-wins, and each replica is sent only what
+   it's missing or has stale.
+
+Ranges with a replica down are skipped and listed in the report's `errors`. Only one repair
+runs per node at a time (a second request gets `409`). Run a repair on every node more often
+than `--gc-grace-secs` (10 days by default). Otherwise a replica that missed a delete can bring
+the document back after the tombstone is purged.
+
+The end-to-end test wipes a node's data directory, and repair rebuilds all of it from its peers.
+It also checks that a write and a delete that each reached only one replica get propagated.
+
 ## Simplifications (vs. the real things)
 
 - Fixed-timeout failure detector instead of phi-accrual. Gossip sends full state, not digests.
 - Size-tiered compaction only, with no leveled compaction. There's no block cache (the OS page
   cache does that job), no compression, and no write throttling if flushes fall behind.
 - Values are stored as JSON text inside SSTables, not a binary format like BSON.
-- Hints are in memory only, so they're lost if the coordinator restarts. No anti-entropy
-  (Merkle-tree) repair.
+- Hints are in memory only, so they're lost if the coordinator restarts (repair covers that).
+- Repair rescans a replica's whole dataset each run. There are no incremental or
+  per-SSTable repaired markers, and streamed data isn't paged, so one repair response holds
+  all entries in the differing leaves.
 - No data streaming when nodes join or leave. A new node only gets data through new writes,
   hints, and read repair. Changing the cluster under live data needs a repair this doesn't
   implement.

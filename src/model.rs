@@ -110,6 +110,7 @@ pub enum DbError {
     Unavailable { required: usize, alive: usize },
     /// Attempted, but too few replicas responded successfully.
     Timeout { required: usize, acked: usize },
+    Conflict(String),
     Internal(String),
 }
 
@@ -126,6 +127,7 @@ impl std::fmt::Display for DbError {
                 f,
                 "timeout: {required} replica responses required but only {acked} succeeded"
             ),
+            DbError::Conflict(m) => write!(f, "conflict: {m}"),
             DbError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
