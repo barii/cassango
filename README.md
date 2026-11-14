@@ -10,7 +10,7 @@ with **MongoDB-style documents and queries**.
 | Replication factor + tunable consistency `one` / `quorum` / `all` | Sort / skip / limit |
 | Last-write-wins timestamps, tombstones, gc_grace | Update operators: `$set $unset $inc $push` |
 | Hinted handoff, read repair | |
-| Commit log + memtable + snapshot compaction | |
+| LSM storage: commit log → memtable → SSTables, bloom filters, size-tiered compaction | |
 
 ## Run a cluster
 
@@ -54,7 +54,8 @@ curl -XPOST localhost:7003/collections/users/find -d '{
 
 curl localhost:7001/cluster                     # members, UP/DOWN, ownership, pending hints
 curl localhost:7001/cluster/owners/users/bob    # which nodes hold a key
-curl localhost:7001/collections                 # local per-node doc counts
+curl localhost:7001/collections                 # local doc counts + storage stats (memtable, SSTables)
+curl -XPOST 'localhost:7001/admin/compact?major=true'   # flush + compact this node
 ```
 
 Errors: `400` bad request, `404` not found, `503` not enough live replicas
@@ -69,7 +70,11 @@ src/
   ring.rs         token ring (FNV-1a + splitmix64), vnodes, replica placement, ownership
   coordinator.rs  replicated write/read with consistency levels, hinted handoff,
                   read repair, two-phase scatter/gather find
-  storage.rs      commitlog.jsonl + in-memory BTreeMaps + snapshot.json compaction, LWW apply
+  storage/
+    mod.rs        LSM engine: memtable, flush/compaction worker, reads & scans
+    commitlog.rs  segmented write-ahead log with CRC-framed records
+    sstable.rs    SSTable format: 4 KiB blocks, sparse index, bloom filter, CRCs
+    merge.rs      k-way merge with last-write-wins reconciliation
   query.rs        filter matching, validation, sorting, update operators
   api.rs          axum HTTP API (public + /internal/* node-to-node)
 ```
@@ -86,10 +91,42 @@ level, returns the newest version (LWW), then repairs stale replicas in the back
 every node's version of those ids, resolves them by LWW, and runs the filter again. That way a
 stale replica can't return a document that was since updated or deleted.
 
+## On-disk storage
+
+Each node runs a log-structured merge tree, like Cassandra:
+
+```
+write ─► commit log segment ─► memtable ──(> --memtable-mb)──► frozen ─► SSTable (background flush)
+                                                                        │
+                       size-tiered compaction merges ≥ --compaction-threshold similar-sized SSTables
+```
+
+- **Commit log:** records are framed as `len | crc32 | json`. A torn tail after a crash is
+  detected and skipped. Segments are deleted once their memtable is safely in an SSTable.
+  Pass `--fsync` to fsync after every write batch.
+- **SSTables** (`sst-<gen>.db`) are immutable and sorted. Data sits in ~4 KiB blocks, each with
+  a CRC32. Each file has a sparse block index and a bloom filter (10 bits per key), both loaded
+  into memory, and a footer holding the max timestamp. Files are written to a `.tmp` name,
+  fsynced and renamed into place, so a crash never leaves a half-written table behind.
+- **Writes never read.** The newest version of a key is chosen at read time by timestamp
+  across the memtable, memtables being flushed, and SSTables. Point reads skip an SSTable if
+  its bloom filter rules the key out, or if its max timestamp is older than the best version
+  already found.
+- **Scans** (`find`) stream a k-way merge over all sources, so a node's data no longer has to
+  fit in RAM. Only memtables, indexes and bloom filters stay in memory.
+- **Compaction** merges similar-sized SSTables, keeping the newest version of each key.
+  Tombstones older than `--gc-grace-secs` are purged, but only if no SSTable outside the
+  compaction and no memtable might still hold an older value for that key. Otherwise a
+  deleted document could come back.
+- **Graceful shutdown** (SIGINT) flushes the memtable. After a crash, the commit log is
+  replayed on startup.
+
 ## Simplifications (vs. the real things)
 
 - Fixed-timeout failure detector instead of phi-accrual. Gossip sends full state, not digests.
-- No SSTables: the whole dataset lives in memory and is snapshotted to one JSON file.
+- Size-tiered compaction only, with no leveled compaction. There's no block cache (the OS page
+  cache does that job), no compression, and no write throttling if flushes fall behind.
+- Values are stored as JSON text inside SSTables, not a binary format like BSON.
 - Hints are in memory only, so they're lost if the coordinator restarts. No anti-entropy
   (Merkle-tree) repair.
 - No data streaming when nodes join or leave. A new node only gets data through new writes,

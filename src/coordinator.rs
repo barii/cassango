@@ -12,7 +12,7 @@ use crate::gossip::Gossiper;
 use crate::model::*;
 use crate::query;
 use crate::ring::key_token;
-use crate::storage::Storage;
+use crate::storage::{blocking, Storage};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -99,7 +99,8 @@ impl Node {
 
     async fn send_mutations(&self, node: &str, muts: Vec<Mutation>) -> Result<(), String> {
         if node == self.id {
-            self.storage.apply_batch(muts).map(|_| ()).map_err(|e| e.to_string())
+            let st = self.storage.clone();
+            blocking(move || st.apply_batch(muts)).await.map(|_| ())
         } else {
             self.rpc::<_, Value>(node, "/internal/apply", &muts).await.map(|_| ())
         }
@@ -107,7 +108,8 @@ impl Node {
 
     async fn fetch_record(&self, node: &str, c: &str, k: &str) -> Result<Option<Record>, String> {
         if node == self.id {
-            Ok(self.storage.get(c, k))
+            let (st, c, k) = (self.storage.clone(), c.to_string(), k.to_string());
+            blocking(move || st.get(&c, &k)).await
         } else {
             self.rpc(node, "/internal/get", &GetReq { c: c.into(), k: k.into() }).await
         }
@@ -115,7 +117,8 @@ impl Node {
 
     async fn scan_ids(&self, node: &str, c: &str, filter: &Value) -> Result<Vec<String>, String> {
         if node == self.id {
-            Ok(self.storage.scan_ids(c, filter))
+            let (st, c, f) = (self.storage.clone(), c.to_string(), filter.clone());
+            blocking(move || st.scan_ids(&c, &f)).await
         } else {
             self.rpc(node, "/internal/scan", &ScanReq { c: c.into(), filter: filter.clone() }).await
         }
@@ -123,7 +126,8 @@ impl Node {
 
     async fn multiget(&self, node: &str, c: &str, ids: &[String]) -> Result<Vec<(String, Record)>, String> {
         if node == self.id {
-            Ok(self.storage.multiget(c, ids))
+            let (st, c, ids) = (self.storage.clone(), c.to_string(), ids.to_vec());
+            blocking(move || st.multiget(&c, &ids)).await
         } else {
             self.rpc(node, "/internal/multiget", &MultigetReq { c: c.into(), ids: ids.to_vec() }).await
         }

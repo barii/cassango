@@ -14,6 +14,7 @@ BIN=target/release/cassa
 BASE_PORT=7000
 SEEDS="127.0.0.1:7001,127.0.0.1:7002"
 RF=${RF:-3}
+MEMTABLE_MB=${MEMTABLE_MB:-16}
 
 build() { cargo build --release --quiet; }
 
@@ -21,7 +22,7 @@ start_node() {
   local i=$1 port=$((BASE_PORT + $1))
   mkdir -p logs
   "$BIN" --node-id "node$i" --listen "127.0.0.1:$port" --seeds "$SEEDS" \
-         --replication-factor "$RF" --data-dir "data/node$i" \
+         --replication-factor "$RF" --data-dir "data/node$i" --memtable-mb "$MEMTABLE_MB" \
          --gossip-interval-ms 500 --failure-timeout-ms 3000 \
          >>"logs/node$i.log" 2>&1 &
   echo $! >"logs/node$i.pid"
@@ -42,7 +43,10 @@ case "${1:-}" in
     build
     for i in $(seq 1 "${2:-3}"); do start_node "$i"; done ;;
   stop)
-    for f in logs/node*.pid; do [[ -e $f ]] || continue; i=${f#logs/node}; stop_node "${i%.pid}"; done ;;
+    pids=()
+    for f in logs/node*.pid; do [[ -e $f ]] || continue; pids+=("$(cat "$f")"); i=${f#logs/node}; stop_node "${i%.pid}"; done
+    # wait for graceful shutdown (memtable flush) to finish
+    for p in ${pids[@]+"${pids[@]}"}; do while kill -0 "$p" 2>/dev/null; do sleep 0.1; done; done ;;
   kill)    stop_node "$2" KILL ;;
   restart) start_node "$2" ;;
   status)  curl -s "127.0.0.1:$((BASE_PORT + ${2:-1}))/cluster" | python3 -m json.tool ;;

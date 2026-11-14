@@ -56,9 +56,13 @@ struct Args {
     #[arg(long, default_value_t = 5000)]
     failure_timeout_ms: u64,
 
-    /// Compact the commit log into a snapshot after this many writes.
-    #[arg(long, default_value_t = 10_000)]
-    compact_every: usize,
+    /// Flush the memtable to an SSTable once it holds roughly this many MiB.
+    #[arg(long, default_value_t = 16)]
+    memtable_mb: usize,
+
+    /// Size-tiered compaction merges SSTables once this many have similar size.
+    #[arg(long, default_value_t = 4)]
+    compaction_threshold: usize,
 
     /// How long tombstones are kept before being purged (default 10 days).
     #[arg(long, default_value_t = 864_000)]
@@ -87,9 +91,12 @@ async fn main() -> anyhow::Result<()> {
 
     let storage = Arc::new(storage::Storage::open(
         &data_dir,
-        args.compact_every,
-        args.gc_grace_secs,
-        args.fsync,
+        storage::Config {
+            memtable_bytes: args.memtable_mb.max(1) << 20,
+            compaction_threshold: args.compaction_threshold,
+            gc_grace_secs: args.gc_grace_secs,
+            fsync: args.fsync,
+        },
     )?);
     let gossiper = gossip::Gossiper::new(
         args.node_id.clone(),
@@ -122,6 +129,6 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     info!("shutting down; flushing storage");
-    storage.flush()?;
+    storage.shutdown()?;
     Ok(())
 }

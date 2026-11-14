@@ -3,6 +3,7 @@
 use crate::coordinator::{FindRequest, Node};
 use crate::gossip::GossipMsg;
 use crate::model::*;
+use crate::storage::blocking;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -28,6 +29,7 @@ pub fn router(node: Arc<Node>) -> Router {
             get(get_doc).put(replace_doc).patch(patch_doc).delete(delete_doc),
         )
         .route("/collections/{c}/find", post(find))
+        .route("/admin/compact", post(admin_compact))
         // internal
         .route("/internal/gossip", post(i_gossip))
         .route("/internal/apply", post(i_apply))
@@ -137,8 +139,31 @@ async fn owners(State(n): State<AppState>, Path((c, id)): Path<(String, String)>
     Json(json!({ "collection": c, "_id": id, "replicas": replicas }))
 }
 
-async fn local_collections(State(n): State<AppState>) -> Json<Value> {
-    Json(json!({ "node_id": n.id, "local_document_counts": n.storage.stats() }))
+fn internal(e: String) -> ApiError {
+    ApiError(DbError::Internal(e))
+}
+
+async fn local_collections(State(n): State<AppState>) -> ApiResult<Json<Value>> {
+    let st = n.storage.clone();
+    let counts = blocking(move || st.stats()).await.map_err(internal)?;
+    Ok(Json(json!({
+        "node_id": n.id,
+        "local_document_counts": counts,
+        "storage": n.storage.info(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct CompactOpts {
+    #[serde(default)]
+    major: bool,
+}
+
+/// Flush this node's memtable and compact. `?major=true` merges all SSTables into one.
+async fn admin_compact(State(n): State<AppState>, Query(o): Query<CompactOpts>) -> ApiResult<Json<Value>> {
+    let st = n.storage.clone();
+    let compacted = blocking(move || st.compact(o.major)).await.map_err(internal)?;
+    Ok(Json(json!({ "node_id": n.id, "sstables_compacted": compacted, "storage": n.storage.info() })))
 }
 
 async fn insert(
@@ -219,22 +244,23 @@ async fn i_gossip(State(n): State<AppState>, Json(msg): Json<GossipMsg>) -> Json
 }
 
 async fn i_apply(State(n): State<AppState>, Json(muts): Json<Vec<Mutation>>) -> ApiResult<Json<Value>> {
-    let applied = n
-        .storage
-        .apply_batch(muts)
-        .map_err(|e| ApiError(DbError::Internal(e.to_string())))?;
+    let st = n.storage.clone();
+    let applied = blocking(move || st.apply_batch(muts)).await.map_err(internal)?;
     Ok(Json(json!({ "applied": applied })))
 }
 
-async fn i_get(State(n): State<AppState>, Json(r): Json<GetReq>) -> Json<Option<Record>> {
-    Json(n.storage.get(&r.c, &r.k))
+async fn i_get(State(n): State<AppState>, Json(r): Json<GetReq>) -> ApiResult<Json<Option<Record>>> {
+    let st = n.storage.clone();
+    Ok(Json(blocking(move || st.get(&r.c, &r.k)).await.map_err(internal)?))
 }
 
 async fn i_scan(State(n): State<AppState>, Json(r): Json<ScanReq>) -> ApiResult<Json<Vec<String>>> {
     crate::query::validate(&r.filter).map_err(bad)?;
-    Ok(Json(n.storage.scan_ids(&r.c, &r.filter)))
+    let st = n.storage.clone();
+    Ok(Json(blocking(move || st.scan_ids(&r.c, &r.filter)).await.map_err(internal)?))
 }
 
-async fn i_multiget(State(n): State<AppState>, Json(r): Json<MultigetReq>) -> Json<Vec<(String, Record)>> {
-    Json(n.storage.multiget(&r.c, &r.ids))
+async fn i_multiget(State(n): State<AppState>, Json(r): Json<MultigetReq>) -> ApiResult<Json<Vec<(String, Record)>>> {
+    let st = n.storage.clone();
+    Ok(Json(blocking(move || st.multiget(&r.c, &r.ids)).await.map_err(internal)?))
 }

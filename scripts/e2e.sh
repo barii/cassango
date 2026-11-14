@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 C=scripts/cluster.sh
+export MEMTABLE_MB=1   # small memtables so the test exercises SSTable flushes
 N1=127.0.0.1:7001; N2=127.0.0.1:7002; N3=127.0.0.1:7003; N4=127.0.0.1:7004
 pass=0
 ok()   { pass=$((pass+1)); echo "  ✓ $*"; }
@@ -80,6 +81,48 @@ code=$(curl -s -o /dev/null -w '%{http_code}' $N4/collections/users/docs/bob)
 [[ $code == 404 ]] && ok "deleted document is gone (tombstone)" || fail "expected 404, got $code"
 r=$(curl -s -XPOST $N2/collections/users/find -d '{}' -H 'content-type: application/json' | j "d['matched']")
 [[ $r == 3 ]] && ok "find sees 3 remaining docs" || fail "find count $r"
+
+echo "on-disk storage"
+start=$(date +%s.%N)
+python3 - <<'PY'
+import json, http.client, concurrent.futures as cf
+def load(worker):
+    conn = http.client.HTTPConnection("127.0.0.1", 7001 + worker % 4)
+    for i in range(worker, 5000, 8):
+        body = json.dumps({"n": i, "bucket": i % 10, "blob": "x" * 800})
+        conn.request("PUT", f"/collections/bulk/docs/d{i:05}?consistency=quorum", body, {"content-type": "application/json"})
+        r = conn.getresponse(); r.read()
+        assert r.status == 200, r.status
+with cf.ThreadPoolExecutor(8) as ex: list(ex.map(load, range(8)))
+PY
+secs=$(python3 -c "import time; print(round($(date +%s.%N) - $start, 1))")
+ok "bulk-loaded 5000 x ~1KB docs at QUORUM in ${secs}s"
+for _ in $(seq 1 40); do   # flushes happen in the background
+  ssts=$( (ls data/node*/sst-*.db 2>/dev/null || true) | wc -l | tr -d ' ')
+  [[ $ssts -ge 4 ]] && break; sleep 0.25
+done
+[[ $ssts -ge 4 ]] && ok "memtables flushed to $ssts SSTables across the cluster" || fail "expected SSTables on disk, found $ssts"
+q='{"filter":{"bucket":3,"n":{"$gte":4000}},"sort":{"n":-1},"limit":3}'
+r=$(curl -s -XPOST $N3/collections/bulk/find -H 'content-type: application/json' -d "$q" | j "(d['matched'], [x['n'] for x in d['docs']])")
+[[ $r == "(100, [4993, 4983, 4973])" ]] && ok "find over SSTables + memtables: $r" || fail "find: $r"
+
+$C stop >/dev/null
+[[ $(ls data/node*/commitlog-*.log | xargs cat | wc -c | tr -d ' ') == 0 ]] && ok "graceful stop flushed memtables (commit logs empty)" || fail "commit logs not empty after shutdown"
+$C start 4 >/dev/null
+for _ in $(seq 1 40); do
+  up=$(curl -s $N1/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
+  [[ $up == 4 ]] && break; sleep 0.25
+done
+r=$(curl -s -XPOST $N2/collections/bulk/find -H 'content-type: application/json' -d '{"filter":{},"limit":0}' | j "d['matched']")
+[[ $r == 5000 ]] && ok "full cluster restart: all 5000 docs read back from disk" || fail "after restart matched=$r"
+r=$(curl -s $N4/collections/users/docs/dan | j "d['age']")
+[[ $r == 20 ]] && ok "earlier documents intact (dan.age=$r)" || fail "dan: $r"
+
+for i in 1 2 3 4; do curl -s -XPOST "127.0.0.1:700$i/admin/compact?major=true" >/dev/null; done
+per_node=$(for i in 1 2 3 4; do ls data/node$i/sst-*.db | wc -l | tr -d ' '; done | sort -u | tr '\n' ' ')
+[[ $per_node == "1 " ]] && ok "major compaction: exactly 1 SSTable per node" || fail "sstables per node after major compaction: $per_node"
+r=$(curl -s -XPOST $N1/collections/bulk/find -H 'content-type: application/json' -d '{"filter":{"bucket":7}}' | j "d['matched']")
+[[ $r == 500 ]] && ok "data intact after compaction (bucket 7: $r docs)" || fail "after compaction: $r"
 
 echo
 echo "all $pass checks passed"
