@@ -57,6 +57,9 @@ pub struct Config {
 
 type Mem = BTreeMap<Vec<u8>, Record>;
 
+/// Decides, per composite key, whether a cleanup compaction keeps an entry.
+pub type KeyFilter = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 struct Frozen {
     mem: Mem,
     /// Commit log segments with id <= this can be deleted once flushed.
@@ -90,6 +93,7 @@ struct Shared {
 enum Job {
     Flush(Arc<Frozen>),
     Compact { major: bool, done: Option<mpsc::Sender<io::Result<usize>>> },
+    Cleanup { keep: KeyFilter, done: mpsc::Sender<io::Result<u64>> },
     Shutdown(mpsc::Sender<()>),
 }
 
@@ -331,9 +335,19 @@ impl Storage {
     /// Visit every reconciled entry on this node (tombstones included) in key order.
     /// Keys are composite `collection \0 id`, so `ring::hash64(key)` is the token.
     pub fn for_each_entry(&self, mut f: impl FnMut(&[u8], &Record)) -> io::Result<()> {
-        for e in self.scan(&[], None)? {
+        self.scan_from(&[], |k, r| {
+            f(k, r);
+            true
+        })
+    }
+
+    /// Visit reconciled entries with key >= `start` in key order until `f` returns false.
+    pub fn scan_from(&self, start: &[u8], mut f: impl FnMut(&[u8], &Record) -> bool) -> io::Result<()> {
+        for e in self.scan(start, None)? {
             let (key, rec) = e?;
-            f(&key, &rec);
+            if !f(&key, &rec) {
+                break;
+            }
         }
         Ok(())
     }
@@ -406,6 +420,21 @@ impl Storage {
         rx.recv().map_err(|_| io::Error::other("storage worker has stopped"))?
     }
 
+    /// Cleanup compaction: flush, then rewrite every SSTable dropping entries for which
+    /// `keep` returns false (data for token ranges this node no longer owns).
+    /// Returns the number of entries dropped.
+    pub fn cleanup(&self, keep: KeyFilter) -> io::Result<u64> {
+        {
+            let mut s = self.shared.state.lock();
+            self.rotate(&mut s)?;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.jobs
+            .send(Job::Cleanup { keep, done: tx })
+            .map_err(|_| io::Error::other("storage worker has stopped"))?;
+        rx.recv().map_err(|_| io::Error::other("storage worker has stopped"))?
+    }
+
     /// Flush the memtable and stop the background worker.
     pub fn shutdown(&self) -> io::Result<()> {
         {
@@ -444,6 +473,18 @@ fn worker(shared: Arc<Shared>, rx: mpsc::Receiver<Job>) {
                 if let Some(d) = done {
                     let _ = d.send(res);
                 }
+            }
+            Job::Cleanup { keep, done } => {
+                let tables = shared.state.lock().sstables.clone();
+                let res = if tables.is_empty() {
+                    Ok(0)
+                } else {
+                    compact(&shared, tables, Some(&keep)).map(|(_, dropped)| dropped)
+                };
+                if let Err(e) = &res {
+                    error!("cleanup failed: {e}");
+                }
+                let _ = done.send(res);
             }
             Job::Shutdown(ack) => {
                 let _ = ack.send(());
@@ -507,7 +548,7 @@ fn maybe_compact(shared: &Shared) -> io::Result<usize> {
     loop {
         let tables = shared.state.lock().sstables.clone();
         match pick_bucket(&tables, shared.cfg.compaction_threshold) {
-            Some(bucket) => compacted += compact(shared, bucket)?,
+            Some(bucket) => compacted += compact(shared, bucket, None)?.0,
             None => return Ok(compacted),
         }
     }
@@ -518,10 +559,11 @@ fn major_compact(shared: &Shared) -> io::Result<usize> {
     if tables.is_empty() {
         return Ok(0);
     }
-    compact(shared, tables)
+    compact(shared, tables, None).map(|(n, _)| n)
 }
 
-fn compact(shared: &Shared, inputs: Vec<Arc<SsTable>>) -> io::Result<usize> {
+/// Merge `inputs` into one SSTable. Returns (inputs compacted, entries dropped by `keep`).
+fn compact(shared: &Shared, inputs: Vec<Arc<SsTable>>, keep: Option<&KeyFilter>) -> io::Result<(usize, u64)> {
     let (others, generation) = {
         let mut s = shared.state.lock();
         let others: Vec<Arc<SsTable>> = s
@@ -540,9 +582,13 @@ fn compact(shared: &Shared, inputs: Vec<Arc<SsTable>>) -> io::Result<usize> {
 
     let sources: Vec<Source> = inputs.iter().map(|t| Box::new(t.iter_from(&[])) as Source).collect();
     let expected: u64 = inputs.iter().map(|t| t.entries).sum();
-    let mut purged = 0u64;
+    let (mut purged, mut dropped) = (0u64, 0u64);
     let merged = Merge::new(sources, None)?.filter(|e| match e {
         Ok((key, rec)) => {
+            if keep.is_some_and(|k| !k(key)) {
+                dropped += 1;
+                return false;
+            }
             let purge = rec.is_tombstone()
                 && rec.ts < cutoff
                 && !others.iter().any(|o| o.may_contain(key))
@@ -578,9 +624,10 @@ fn compact(shared: &Shared, inputs: Vec<Arc<SsTable>>) -> io::Result<usize> {
         out_entries = n,
         out_bytes,
         purged_tombstones = purged,
+        dropped_unowned = dropped,
         "compacted sstables"
     );
-    Ok(inputs.len())
+    Ok((inputs.len(), dropped))
 }
 
 #[cfg(test)]
@@ -678,6 +725,34 @@ mod tests {
         // Everything survives a restart.
         let s = Storage::open(&dir, cfg(4 * 1024, 3600)).unwrap();
         assert_eq!(s.stats().unwrap()["users"], 2000 - 20);
+        s.shutdown().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleanup_drops_unowned_keys_and_paged_scan() {
+        let dir = tmpdir("cleanup");
+        let s = Storage::open(&dir, cfg(4 * 1024, 3600)).unwrap();
+        let t = now_micros();
+        for i in 0..300u64 {
+            s.apply_batch(vec![m(&format!("{i:03}"), t + i, Some(json!({"i": i})))]).unwrap();
+        }
+        let mut seen = Vec::new();
+        s.scan_from(&encode_key("users", "295"), |k, _| {
+            seen.push(String::from_utf8_lossy(split_key(k).1).into_owned());
+            seen.len() < 3
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["295", "296", "297"]);
+
+        // keep only even ids
+        let dropped = s
+            .cleanup(Arc::new(|k: &[u8]| String::from_utf8_lossy(split_key(k).1).parse::<u64>().unwrap() % 2 == 0))
+            .unwrap();
+        assert_eq!(dropped, 150);
+        assert_eq!(s.stats().unwrap()["users"], 150);
+        assert!(s.get("users", "001").unwrap().is_none());
+        assert!(s.get("users", "002").unwrap().is_some());
         s.shutdown().unwrap();
         fs::remove_dir_all(dir).unwrap();
     }

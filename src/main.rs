@@ -8,6 +8,7 @@ mod api;
 mod coordinator;
 mod gossip;
 mod model;
+mod movement;
 mod query;
 mod repair;
 mod ring;
@@ -69,6 +70,17 @@ struct Args {
     #[arg(long, default_value_t = 864_000)]
     gc_grace_secs: u64,
 
+    /// Don't stream data when joining: start NORMAL immediately (Cassandra's
+    /// auto_bootstrap=false). Use for the initial nodes of a new cluster, or to
+    /// rejoin in place after data loss and fix it with repair.
+    #[arg(long)]
+    no_bootstrap: bool,
+
+    /// How long to wait for a status change to spread through gossip before
+    /// streaming begins (joins, decommission, removenode).
+    #[arg(long, default_value_t = 5000)]
+    ring_delay_ms: u64,
+
     /// Run anti-entropy repair of this node's primary ranges every N seconds
     /// (0 = only on demand via POST /admin/repair). Keep it below --gc-grace-secs.
     #[arg(long, default_value_t = 0)]
@@ -104,11 +116,19 @@ async fn main() -> anyhow::Result<()> {
             fsync: args.fsync,
         },
     )?);
+    // A node that has never finished joining starts as JOINING and bootstraps.
+    let bootstrapped = movement::is_bootstrapped(&data_dir);
+    if args.no_bootstrap && !bootstrapped {
+        movement::mark_bootstrapped(&data_dir)?;
+    }
+    let status = if bootstrapped || args.no_bootstrap { gossip::NodeStatus::Normal } else { gossip::NodeStatus::Joining };
+
     let gossiper = gossip::Gossiper::new(
         args.node_id.clone(),
         advertise.clone(),
         args.seeds.clone(),
         args.vnodes,
+        status,
         Duration::from_millis(args.gossip_interval_ms),
         Duration::from_millis(args.failure_timeout_ms),
         client.clone(),
@@ -119,15 +139,20 @@ async fn main() -> anyhow::Result<()> {
         gossiper.clone(),
         storage.clone(),
         client,
+        data_dir.clone(),
+        Duration::from_millis(args.ring_delay_ms),
     );
 
     gossiper.spawn();
     node.spawn_hint_replayer();
+    if status == gossip::NodeStatus::Joining {
+        node.spawn_bootstrap();
+    }
     node.spawn_repair_scheduler(args.repair_interval_secs);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(node = %args.node_id, listen = %args.listen, advertise = %advertise, seeds = ?args.seeds,
-          rf = args.replication_factor, "cassa node started");
+          rf = args.replication_factor, state = ?status, "cassa node started");
 
     axum::serve(listener, api::router(node))
         .with_graceful_shutdown(async {

@@ -62,6 +62,19 @@ pub fn tokens_for(node_id: &str, vnodes: usize) -> Vec<u64> {
     t
 }
 
+/// Ranges bounded by the union of two rings' tokens. Inside each range both rings
+/// have a fixed replica set (`ring.replicas(range.end, rf)`), so comparing the two
+/// tells exactly which nodes gain or lose that range during a join/leave.
+pub fn movement_ranges(a: &Ring, b: &Ring) -> Vec<TokenRange> {
+    let mut t: Vec<u64> = a.tokens.iter().chain(b.tokens.iter()).map(|(t, _)| *t).collect();
+    t.sort_unstable();
+    t.dedup();
+    let len = t.len();
+    (0..len)
+        .map(|i| TokenRange { start: t[(i + len - 1) % len], end: t[i] })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Ring {
     /// Sorted by token. Each token is owned by one node.
@@ -188,6 +201,20 @@ mod tests {
         let full = TokenRange { start: 5, end: 5 };
         assert!(full.contains(5) && full.contains(0));
         assert!(full.leaf(4, 1024) < 1024);
+    }
+
+    #[test]
+    fn movement_ranges_have_constant_replicas() {
+        let before = ring(3);
+        let after = ring(4);
+        let ranges = movement_ranges(&before, &after);
+        assert_eq!(ranges.len(), 64);
+        for k in 0..300 {
+            let t = key_token("c", &k.to_string());
+            let r = ranges.iter().find(|r| r.contains(t)).unwrap();
+            assert_eq!(before.replicas(t, 3), before.replicas(r.end, 3));
+            assert_eq!(after.replicas(t, 3), after.replicas(r.end, 3));
+        }
     }
 
     #[test]

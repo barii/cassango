@@ -15,9 +15,9 @@ trap '$C stop >/dev/null 2>&1 || true' EXIT
 $C clean >/dev/null 2>&1 || true
 $C start 4
 echo "waiting for gossip to converge..."
-converged() {  # every node sees all 4 nodes UP
+converged() {  # every node sees all 4 nodes UP and NORMAL
   for n in $N1 $N2 $N3 $N4; do
-    up=$(curl -s $n/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
+    up=$(curl -s $n/cluster 2>/dev/null | j "sum(m['status']=='UP' and m['state']=='NORMAL' for m in d['members'])" 2>/dev/null || echo 0)
     [[ $up == 4 ]] || return 1
   done
 }
@@ -146,7 +146,8 @@ s1=$(states users eve); s2=$(states users $id)
 
 # (b) A node loses its disk.
 before=$(curl -s $N3/collections | j "d['local_document_counts'].get('bulk',0)")
-$C kill 3 >/dev/null; rm -rf data/node3; $C restart 3 >/dev/null
+# --no-bootstrap: rejoin in place with an empty disk (otherwise it would re-stream on join)
+$C kill 3 >/dev/null; rm -rf data/node3; EXTRA_ARGS=--no-bootstrap $C restart 3 >/dev/null
 for _ in $(seq 1 60); do
   up=$(curl -s $N3/cluster 2>/dev/null | j "sum(m['status']=='UP' for m in d['members'])" 2>/dev/null || echo 0)
   seen=$(curl -s $N1/cluster | j "[m['status'] for m in d['members'] if m['node_id']=='node3'][0]")
@@ -173,6 +174,97 @@ for _ in $(seq 1 40); do
 done
 r=$(curl -s -XPOST $N1/admin/repair | j "(d['ranges_skipped'] > 0, d['ranges_skipped'] + d['ranges_in_sync'] == d['ranges'], len(d['errors']) > 0)")
 [[ $r == "(True, True, True)" ]] && ok "repair with a replica down skips its ranges and reports why" || fail "repair with node down: $r"
+
+echo "range movements (join / decommission / removenode)"
+$C restart 4 >/dev/null
+for _ in $(seq 1 60); do converged && break; sleep 0.25; done
+converged && ok "node4 back; cluster of 4 NORMAL nodes" || fail "node4 did not rejoin"
+
+# Expect each bulk key on exactly RF=3 replicas, and every replica to have it.
+placement() {  # usage: placement <coordinator port> [collection count] -> "ok" or the problem
+  python3 - "$1" "${2:-bulk}" "${3:-5000}" <<'PY'
+import json, sys, http.client, random
+port, coll, count = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+def call(p, method, path, body=None):
+    c = http.client.HTTPConnection("127.0.0.1", p, timeout=10)
+    c.request(method, path, json.dumps(body) if body is not None else None, {"content-type": "application/json"})
+    r = c.getresponse(); return json.loads(r.read())
+random.seed(7)
+bad = []
+for i in random.sample(range(count), min(150, count)):
+    k = f"d{i:05}"
+    reps = [r["node_id"] for r in call(port, "GET", f"/cluster/owners/{coll}/{k}")["replicas"]]
+    for r in reps:
+        rec = call(7000 + int(r[4:]), "POST", "/internal/get", {"c": coll, "k": k})
+        if not rec or rec["v"] is None: bad.append(f"{k}@{r}")
+print("ok" if not bad else f"{len(bad)} missing, e.g. {bad[:3]}")
+PY
+}
+local_total() { for i in "$@"; do curl -s 127.0.0.1:700$i/collections | j "d['local_document_counts'].get('bulk',0)"; done | paste -sd+ - | bc; }
+wait_state() {  # wait_state <port> <node> <STATE>
+  for _ in $(seq 1 120); do
+    st=$(curl -s 127.0.0.1:$1/cluster | j "[m['state'] for m in d['members'] if m['node_id']=='$2'][0]" 2>/dev/null)
+    [[ $st == $3 ]] && return 0; sleep 0.25
+  done; return 1
+}
+
+# --- join: a brand-new node5 bootstraps and streams its ranges ---
+# longer ring delay on the joiner leaves a clear window to write during the join
+RING_DELAY_MS=6000 $C join 5 >/dev/null
+wait_state 7005 node5 JOINING && ok "node5 starts as JOINING" || fail "node5 did not start JOINING"
+for p in 7001 7002 7003 7004; do wait_state $p node5 JOINING || true; done
+python3 - <<'PY'
+import json, http.client
+c = http.client.HTTPConnection("127.0.0.1", 7001)
+for i in range(300):
+    c.request("PUT", f"/collections/during_join/docs/d{i:05}", json.dumps({"i": i}), {"content-type": "application/json"})
+    r = c.getresponse(); r.read(); assert r.status == 200
+PY
+st=$(curl -s $N1/cluster | j "[m['state'] for m in d['members'] if m['node_id']=='node5'][0]")
+[[ $st == JOINING ]] && ok "wrote 300 docs while node5 was still JOINING" || fail "node5 already $st; write window missed"
+wait_state 7001 node5 NORMAL && ok "node5 bootstrapped and became NORMAL" || fail "node5 never became NORMAL"
+for p in 7002 7003 7004 7005; do wait_state $p node5 NORMAL || fail "port $p never saw node5 NORMAL"; done
+streamed=$(grep -o 'bootstrap streaming complete.*entries[^ ]*' logs/node5.log | tail -1 | grep -oE '[0-9]+' | head -1)
+n5=$(local_total 5)
+[[ $n5 -gt 1000 ]] && ok "node5 streamed its share of the data ($n5 bulk docs)" || fail "node5 only has $n5 docs"
+r=$(placement 7001); [[ $r == ok ]] && ok "every sampled key is on all 3 of its new replicas" || fail "placement after join: $r"
+r=$(placement 7001 during_join 300); [[ $r == ok ]] && ok "writes made during the join reached node5 (pending replica)" || fail "during-join writes: $r"
+before=$(local_total 1 2 3 4 5)
+$C cleanup | sed 's/^/    /'
+after=$(local_total 1 2 3 4 5)
+[[ $before -gt 15000 && $after == 15000 ]] && ok "cleanup removed copies old owners no longer own ($before -> $after = 5000 x RF)" || fail "cleanup: $before -> $after"
+r=$(curl -s -XPOST $N2/collections/bulk/find -H 'content-type: application/json' -d '{"limit":0}' | j "d['matched']")
+[[ $r == 5000 ]] && ok "find still sees all 5000 docs" || fail "find after join: $r"
+
+# --- decommission: node2 hands its ranges to the others and leaves ---
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPOST $N2/admin/decommission)
+[[ $code == 200 ]] && ok "node2 decommissioned" || fail "decommission returned $code"
+wait_state 7001 node2 LEFT && ok "cluster sees node2 as LEFT" || fail "node2 not LEFT"
+$C kill 2 >/dev/null
+for p in 7003 7004 7005; do wait_state $p node2 LEFT || fail "port $p never saw node2 LEFT"; done
+r=$(placement 7001); [[ $r == ok ]] && ok "node2's ranges re-replicated to their new owners" || fail "placement after decommission: $r"
+$C cleanup >/dev/null
+r=$(local_total 1 3 4 5); [[ $r == 15000 ]] && ok "remaining 4 nodes hold exactly 5000 x RF copies" || fail "copies after decommission: $r"
+
+# --- removenode: node5 dies for good; node1 re-replicates its data from survivors ---
+$C kill 5 >/dev/null
+for _ in $(seq 1 40); do
+  st=$(curl -s $N1/cluster | j "[m['status'] for m in d['members'] if m['node_id']=='node5'][0]")
+  [[ $st == DOWN ]] && break; sleep 0.25
+done
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPOST $N1/admin/removenode/node3)
+[[ $code == 409 ]] && ok "removenode refuses a live node (409)" || fail "expected 409, got $code"
+r=$(curl -s -XPOST $N1/admin/removenode/node5 | j "(d['operation'], d['entries_streamed'] > 0)")
+[[ $r == "('removenode', True)" ]] && ok "removenode node5 re-streamed its data from surviving replicas" || fail "removenode: $r"
+wait_state 7003 node5 LEFT && ok "node5 is LEFT cluster-wide" || fail "node5 not LEFT"
+r=$(placement 7003); [[ $r == ok ]] && ok "every key fully replicated on the 3 survivors" || fail "placement after removenode: $r"
+r=$(for i in 1 3 4; do curl -s 127.0.0.1:700$i/collections | j "d['local_document_counts'].get('bulk',0)"; done | sort -u | tr '\n' ' ')
+[[ $r == "5000 " ]] && ok "3 nodes, RF=3: each holds all 5000 docs" || fail "per-node counts: $r"
+wait_state 7004 node5 LEFT || fail "node4 never saw node5 LEFT"
+r=$(curl -s -XPOST $N4/collections/users/find -H 'content-type: application/json' -d '{}' | j "(d['matched'], d['partial'])")
+[[ $r == "(3, False)" ]] && ok "queries complete and not partial with LEFT nodes gone ($r)" || fail "users find: $r"
+code=$(curl -s -o /dev/null -w '%{http_code}' -XPUT "$N1/collections/users/docs/zed?consistency=all" -H 'content-type: application/json' -d '{"n":1}')
+[[ $code == 200 ]] && ok "writes at ALL succeed on the shrunken cluster" || fail "ALL write: $code"
 
 echo
 echo "all $pass checks passed"

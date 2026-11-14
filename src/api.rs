@@ -31,6 +31,11 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/collections/{c}/find", post(find))
         .route("/admin/compact", post(admin_compact))
         .route("/admin/repair", post(admin_repair).get(last_repair))
+        .route("/admin/decommission", post(admin_decommission))
+        .route("/admin/removenode/{id}", post(admin_removenode))
+        .route("/admin/cleanup", post(admin_cleanup))
+        .route("/internal/stream", post(i_stream))
+        .route("/internal/pull", post(i_pull))
         .route("/internal/repair/trees", post(i_repair_trees))
         .route("/internal/repair/fetch", post(i_repair_fetch))
         // internal
@@ -103,6 +108,7 @@ async fn info(State(n): State<AppState>) -> Json<Value> {
         "name": "cassa",
         "version": env!("CARGO_PKG_VERSION"),
         "node_id": n.id,
+        "state": n.gossip.my_status(),
         "replication_factor": n.rf,
     }))
 }
@@ -118,6 +124,7 @@ async fn cluster(State(n): State<AppState>) -> Json<Value> {
                 "node_id": s.node_id,
                 "addr": s.addr,
                 "status": if n.gossip.is_alive(&s.node_id) { "UP" } else { "DOWN" },
+                "state": s.status,
                 "generation": s.generation,
                 "heartbeat": s.heartbeat,
                 "last_seen_secs_ago": n.gossip.seconds_since_seen(&s.node_id),
@@ -129,6 +136,7 @@ async fn cluster(State(n): State<AppState>) -> Json<Value> {
     Json(json!({
         "coordinator": n.id,
         "replication_factor": n.rf,
+        "pending_range_movements": n.gossip.has_pending_movements(),
         "members": members,
         "pending_hints": n.hint_counts(),
     }))
@@ -251,11 +259,41 @@ async fn admin_repair(State(n): State<AppState>, Query(o): Query<RepairOpts>) ->
     Ok(Json(serde_json::to_value(report).map_err(|e| internal(e.to_string()))?))
 }
 
+/// Stream this node's data to the nodes taking over its ranges, then leave the cluster.
+async fn admin_decommission(State(n): State<AppState>) -> ApiResult<Json<Value>> {
+    let report = n.decommission().await?;
+    Ok(Json(serde_json::to_value(report).map_err(|e| internal(e.to_string()))?))
+}
+
+/// Remove a dead node: re-replicate its ranges from surviving replicas and mark it LEFT.
+async fn admin_removenode(State(n): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let report = n.removenode(&id).await?;
+    Ok(Json(serde_json::to_value(report).map_err(|e| internal(e.to_string()))?))
+}
+
+/// Drop local data for ranges this node no longer owns (run after a node joins).
+async fn admin_cleanup(State(n): State<AppState>) -> ApiResult<Json<Value>> {
+    let dropped = n.cleanup().await?;
+    Ok(Json(json!({ "node_id": n.id, "dropped_entries": dropped, "storage": n.storage.info() })))
+}
+
 async fn last_repair(State(n): State<AppState>) -> Json<Value> {
     Json(json!({ "node_id": n.id, "last_repair": *n.last_repair.lock() }))
 }
 
 // ------------------------------------------------------------------ internal handlers
+
+async fn i_stream(
+    State(n): State<AppState>,
+    Json(r): Json<crate::movement::StreamReq>,
+) -> ApiResult<Json<crate::movement::StreamPage>> {
+    let st = n.storage.clone();
+    Ok(Json(blocking(move || crate::movement::stream_page(&st, &r)).await.map_err(internal)?))
+}
+
+async fn i_pull(State(n): State<AppState>, Json(r): Json<crate::movement::PullReq>) -> ApiResult<Json<crate::movement::PullReport>> {
+    Ok(Json(n.pull_ranges(r.plan).await.map_err(internal)?))
+}
 
 async fn i_repair_trees(
     State(n): State<AppState>,

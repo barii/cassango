@@ -1,4 +1,4 @@
-//! Gossip-based cluster membership and failure detection.
+//! Gossip-based cluster membership, node lifecycle and failure detection.
 //!
 //! Every node keeps an `EndpointState` for each node it knows about. Once per
 //! interval a node bumps its own heartbeat and does a push/pull exchange of the
@@ -7,8 +7,16 @@
 //!   * sometimes one random unreachable peer (so recoveries are noticed),
 //!   * sometimes a seed (so partitions heal and new nodes get introduced).
 //!
-//! States are versioned by `(generation, heartbeat)`; the higher version wins.
-//! `generation` is the node's start time, so a restarted node supersedes its old state.
+//! States are versioned by `(generation, heartbeat, status_seq)` and the higher
+//! version wins. `generation` is the node's start time, so a restarted node
+//! supersedes its old state. `status_seq` lets *another* node change a node's
+//! lifecycle status (`removenode` on a dead node) without faking its heartbeat.
+//!
+//! Lifecycle: JOINING → NORMAL → LEAVING → LEFT. Two rings are derived:
+//!   * the **current** ring (NORMAL + LEAVING) serves reads and counts write acks,
+//!   * the **future** ring (NORMAL + JOINING) is the ring once in-flight range
+//!     movements finish. Replicas in the future ring but not the current one are
+//!     *pending*: they receive writes so they don't miss data while streaming.
 //!
 //! Failure detection is timeout-based: a peer is considered down if we haven't
 //! seen its heartbeat advance (directly or second-hand) within `failure_timeout`.
@@ -23,6 +31,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NodeStatus {
+    /// Bootstrapping: receiving writes for its future ranges and streaming data in.
+    Joining,
+    Normal,
+    /// Decommissioning / being removed: still serves its ranges while they are streamed away.
+    Leaving,
+    /// Gone: owns nothing. Kept in the state map so stale gossip can't resurrect it.
+    Left,
+}
+
+fn normal() -> NodeStatus {
+    NodeStatus::Normal
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EndpointState {
     pub node_id: String,
@@ -30,11 +54,15 @@ pub struct EndpointState {
     pub generation: u64,
     pub heartbeat: u64,
     pub tokens: Vec<u64>,
+    #[serde(default = "normal")]
+    pub status: NodeStatus,
+    #[serde(default)]
+    pub status_seq: u64,
 }
 
 impl EndpointState {
-    fn version(&self) -> (u64, u64) {
-        (self.generation, self.heartbeat)
+    fn version(&self) -> (u64, u64, u64) {
+        (self.generation, self.heartbeat, self.status_seq)
     }
 }
 
@@ -51,20 +79,23 @@ pub struct Gossiper {
     interval: Duration,
     failure_timeout: Duration,
     states: RwLock<HashMap<String, EndpointState>>,
-    /// When we last saw each peer's version advance.
+    /// When we last saw each peer's heartbeat advance.
     last_seen: RwLock<HashMap<String, Instant>>,
     ring: RwLock<Arc<Ring>>,
+    future_ring: RwLock<Arc<Ring>>,
     /// Last reported liveness, used only to log UP/DOWN transitions.
     reported: Mutex<HashMap<String, bool>>,
     client: reqwest::Client,
 }
 
 impl Gossiper {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         self_id: String,
         self_addr: String,
         seeds: Vec<String>,
         vnodes: usize,
+        status: NodeStatus,
         interval: Duration,
         failure_timeout: Duration,
         client: reqwest::Client,
@@ -76,6 +107,8 @@ impl Gossiper {
             generation,
             heartbeat: 0,
             tokens: ring::tokens_for(&self_id, vnodes),
+            status,
+            status_seq: 0,
         };
         let g = Arc::new(Gossiper {
             self_id: self_id.clone(),
@@ -86,15 +119,22 @@ impl Gossiper {
             states: RwLock::new(HashMap::from([(self_id, me)])),
             last_seen: RwLock::new(HashMap::new()),
             ring: RwLock::new(Arc::new(Ring::default())),
+            future_ring: RwLock::new(Arc::new(Ring::default())),
             reported: Mutex::new(HashMap::new()),
             client,
         });
-        g.rebuild_ring();
+        g.rebuild_rings();
         g
     }
 
+    /// The ring that serves reads and counts write acknowledgements.
     pub fn ring(&self) -> Arc<Ring> {
         self.ring.read().clone()
+    }
+
+    /// The ring as it will be once in-flight joins/leaves complete.
+    pub fn future_ring(&self) -> Arc<Ring> {
+        self.future_ring.read().clone()
     }
 
     pub fn is_alive(&self, node_id: &str) -> bool {
@@ -110,18 +150,40 @@ impl Gossiper {
         self.states.read().get(node_id).map(|s| s.addr.clone())
     }
 
+    pub fn status_of(&self, node_id: &str) -> Option<NodeStatus> {
+        self.states.read().get(node_id).map(|s| s.status)
+    }
+
+    pub fn my_status(&self) -> NodeStatus {
+        self.status_of(&self.self_id).expect("self state")
+    }
+
+    /// True while any node is joining or leaving.
+    pub fn has_pending_movements(&self) -> bool {
+        self.states
+            .read()
+            .values()
+            .any(|s| matches!(s.status, NodeStatus::Joining | NodeStatus::Leaving))
+    }
+
     pub fn members(&self) -> Vec<EndpointState> {
         let mut v: Vec<_> = self.states.read().values().cloned().collect();
         v.sort_by(|a, b| a.node_id.cmp(&b.node_id));
         v
     }
 
-    pub fn live_members(&self) -> Vec<String> {
+    /// Nodes that are part of the cluster (anything but LEFT).
+    pub fn active_members(&self) -> Vec<String> {
         self.members()
             .into_iter()
+            .filter(|s| s.status != NodeStatus::Left)
             .map(|s| s.node_id)
-            .filter(|id| self.is_alive(id))
             .collect()
+    }
+
+    /// Active members that are currently reachable.
+    pub fn live_members(&self) -> Vec<String> {
+        self.active_members().into_iter().filter(|id| self.is_alive(id)).collect()
     }
 
     pub fn seconds_since_seen(&self, node_id: &str) -> Option<f64> {
@@ -142,6 +204,27 @@ impl Gossiper {
         }
     }
 
+    /// Change our own lifecycle status and spread it immediately.
+    pub fn set_status(&self, status: NodeStatus) {
+        self.set_status_of(&self.self_id.clone(), status);
+    }
+
+    /// Change any node's status (used by `removenode` on behalf of a dead node).
+    pub fn set_status_of(&self, node_id: &str, status: NodeStatus) -> bool {
+        {
+            let mut states = self.states.write();
+            let Some(s) = states.get_mut(node_id) else { return false };
+            if s.status == status {
+                return true;
+            }
+            info!(node = %node_id, from = ?s.status, to = ?status, "status change");
+            s.status = status;
+            s.status_seq += 1;
+        }
+        self.rebuild_rings();
+        true
+    }
+
     /// Merge remote states into ours, keeping the newest version of each.
     pub fn merge(&self, incoming: Vec<EndpointState>) {
         let mut ring_changed = false;
@@ -152,44 +235,60 @@ impl Gossiper {
                 if s.node_id == self.self_id {
                     continue; // we are the authority on ourselves
                 }
-                match states.get(&s.node_id) {
+                let heartbeat_advanced = match states.get(&s.node_id) {
                     Some(cur) if cur.version() >= s.version() => continue,
                     Some(cur) => {
                         if cur.generation != s.generation {
                             info!(node = %s.node_id, "node restarted (generation {} -> {})", cur.generation, s.generation);
                         }
-                        ring_changed |= cur.tokens != s.tokens || cur.addr != s.addr;
+                        if cur.status != s.status {
+                            info!(node = %s.node_id, from = ?cur.status, to = ?s.status, "node status changed");
+                        }
+                        ring_changed |= cur.tokens != s.tokens || cur.addr != s.addr || cur.status != s.status;
+                        (s.generation, s.heartbeat) > (cur.generation, cur.heartbeat)
                     }
                     None => {
-                        info!(node = %s.node_id, addr = %s.addr, "discovered new node");
+                        info!(node = %s.node_id, addr = %s.addr, status = ?s.status, "discovered node");
                         ring_changed = true;
+                        true
                     }
+                };
+                // A status change made by someone else is not proof the node is alive.
+                if heartbeat_advanced {
+                    seen.insert(s.node_id.clone(), Instant::now());
                 }
-                seen.insert(s.node_id.clone(), Instant::now());
                 states.insert(s.node_id.clone(), s);
             }
         }
         if ring_changed {
-            self.rebuild_ring();
+            self.rebuild_rings();
         }
     }
 
-    fn rebuild_ring(&self) {
+    fn rebuild_rings(&self) {
+        use NodeStatus::*;
+        let states = self.states.read();
+        let build = |keep: &dyn Fn(NodeStatus) -> bool| {
+            Arc::new(Ring::new(
+                states
+                    .values()
+                    .filter(|s| keep(s.status))
+                    .map(|s| (s.node_id.clone(), s.tokens.clone())),
+            ))
+        };
         // Down nodes stay in the ring (they still own their ranges, as in Cassandra);
         // requests to them fail over to hints / other replicas.
-        let ring = Ring::new(
-            self.states
-                .read()
-                .values()
-                .map(|s| (s.node_id.clone(), s.tokens.clone())),
-        );
-        *self.ring.write() = Arc::new(ring);
+        let current = build(&|st| matches!(st, Normal | Leaving));
+        let future = build(&|st| matches!(st, Normal | Joining));
+        drop(states);
+        *self.ring.write() = current;
+        *self.future_ring.write() = future;
     }
 
     fn log_transitions(&self) {
         let mut reported = self.reported.lock();
         for s in self.members() {
-            if s.node_id == self.self_id {
+            if s.node_id == self.self_id || s.status == NodeStatus::Left {
                 continue;
             }
             let alive = self.is_alive(&s.node_id);
@@ -225,6 +324,7 @@ impl Gossiper {
             .members()
             .into_iter()
             .filter(|s| s.node_id != self.self_id)
+            .filter(|s| s.status != NodeStatus::Left || self.is_alive(&s.node_id))
             .partition(|s| self.is_alive(&s.node_id));
 
         let mut targets: Vec<String> = Vec::new();

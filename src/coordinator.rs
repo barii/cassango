@@ -36,6 +36,9 @@ pub struct Node {
     clock: AtomicU64,
     pub(crate) repair_lock: tokio::sync::Mutex<()>,
     pub(crate) last_repair: Mutex<Option<crate::repair::RepairReport>>,
+    pub(crate) movement_lock: tokio::sync::Mutex<()>,
+    pub(crate) data_dir: std::path::PathBuf,
+    pub(crate) ring_delay: Duration,
 }
 
 #[derive(Deserialize, Default)]
@@ -57,7 +60,16 @@ pub struct FindResult {
 }
 
 impl Node {
-    pub fn new(id: String, rf: usize, gossip: Arc<Gossiper>, storage: Arc<Storage>, client: reqwest::Client) -> Arc<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        rf: usize,
+        gossip: Arc<Gossiper>,
+        storage: Arc<Storage>,
+        client: reqwest::Client,
+        data_dir: std::path::PathBuf,
+        ring_delay: Duration,
+    ) -> Arc<Self> {
         Arc::new(Node {
             id,
             rf: rf.max(1),
@@ -68,6 +80,9 @@ impl Node {
             clock: AtomicU64::new(0),
             repair_lock: tokio::sync::Mutex::new(()),
             last_repair: Mutex::new(None),
+            movement_lock: tokio::sync::Mutex::new(()),
+            data_dir,
+            ring_delay,
         })
     }
 
@@ -89,11 +104,23 @@ impl Node {
     // ------------------------------------------------------------ RPC plumbing
 
     pub(crate) async fn rpc<B: Serialize, R: DeserializeOwned>(&self, node: &str, path: &str, body: &B) -> Result<R, String> {
+        self.rpc_timeout(node, path, body, None).await
+    }
+
+    /// RPC with a custom timeout, for long-running operations such as streaming.
+    pub(crate) async fn rpc_timeout<B: Serialize, R: DeserializeOwned>(
+        &self,
+        node: &str,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<R, String> {
         let addr = self.gossip.addr_of(node).ok_or_else(|| format!("unknown node {node}"))?;
-        let resp = self
-            .client
-            .post(format!("http://{addr}{path}"))
-            .json(body)
+        let mut req = self.client.post(format!("http://{addr}{path}")).json(body);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req
             .send()
             .await
             .and_then(|r| r.error_for_status())
@@ -159,11 +186,15 @@ impl Node {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             loop {
                 tick.tick().await;
-                let ready: Vec<String> = me
-                    .hint_counts()
-                    .into_keys()
-                    .filter(|n| me.gossip.is_alive(n))
-                    .collect();
+                let mut ready = Vec::new();
+                for n in me.hint_counts().into_keys() {
+                    if me.gossip.status_of(&n) == Some(crate::gossip::NodeStatus::Left) {
+                        let dropped = me.hints.lock().remove(&n).map_or(0, |h| h.len());
+                        info!(node = %n, dropped, "dropping hints for node that left the cluster");
+                    } else if me.gossip.is_alive(&n) {
+                        ready.push(n);
+                    }
+                }
                 for node in ready {
                     let batch = me.hints.lock().remove(&node).unwrap_or_default();
                     let n = batch.len();
@@ -187,7 +218,29 @@ impl Node {
         self.replicate(m, cl).await
     }
 
+    /// Nodes that will own the key once in-flight joins/leaves finish but don't yet.
+    pub fn pending_for(&self, c: &str, k: &str) -> Vec<String> {
+        let natural = self.replicas_for(c, k);
+        self.gossip
+            .future_ring()
+            .replicas(key_token(c, k), self.rf)
+            .into_iter()
+            .filter(|n| !natural.contains(n))
+            .collect()
+    }
+
     async fn replicate(self: &Arc<Self>, m: Mutation, cl: Consistency) -> Result<(), DbError> {
+        // Pending replicas (bootstrapping nodes, new owners of a leaving node's ranges)
+        // get every write too, so they don't miss anything while streaming, but they
+        // don't count toward the consistency level.
+        for n in self.pending_for(&m.c, &m.k) {
+            let (me, m) = (self.clone(), m.clone());
+            tokio::spawn(async move {
+                if !me.gossip.is_alive(&n) || me.send_mutations(&n, vec![m.clone()]).await.is_err() {
+                    me.add_hint(&n, m);
+                }
+            });
+        }
         let replicas = self.replicas_for(&m.c, &m.k);
         if replicas.is_empty() {
             return Err(DbError::Internal("ring is empty".into()));
@@ -313,7 +366,7 @@ impl Node {
         let filter = if req.filter.is_null() { Value::Object(Map::new()) } else { req.filter };
         query::validate(&filter).map_err(DbError::BadRequest)?;
 
-        let members = self.gossip.members().len();
+        let members = self.gossip.active_members().len();
         let nodes = self.gossip.live_members();
         let mut partial = nodes.len() < members;
 

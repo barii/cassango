@@ -10,6 +10,7 @@ with **MongoDB-style documents and queries**.
 | Replication factor + tunable consistency `one` / `quorum` / `all` | Sort / skip / limit |
 | Last-write-wins timestamps, tombstones, gc_grace | Update operators: `$set $unset $inc $push` |
 | Hinted handoff, read repair, Merkle-tree anti-entropy repair | |
+| Node lifecycle: bootstrap, decommission, removenode, cleanup | |
 | LSM storage: commit log → memtable → SSTables, bloom filters, size-tiered compaction | |
 
 ## Run a cluster
@@ -20,6 +21,10 @@ scripts/cluster.sh status       # gossip view
 scripts/cluster.sh kill 2       # hard-kill node2
 scripts/cluster.sh restart 2
 scripts/cluster.sh repair       # anti-entropy repair on every node
+scripts/cluster.sh join 4       # add a new node4: it bootstraps and streams its ranges
+scripts/cluster.sh cleanup      # drop data old owners no longer own (after a join)
+scripts/cluster.sh decommission 2   # node2 streams its ranges away, then stops
+scripts/cluster.sh removenode node3 # re-replicate a dead node's data, mark it LEFT
 scripts/cluster.sh clean        # stop + wipe data/ logs/
 scripts/e2e.sh                  # full end-to-end test (4 nodes, failure + recovery)
 ```
@@ -59,6 +64,9 @@ curl localhost:7001/collections                 # local doc counts + storage sta
 curl -XPOST 'localhost:7001/admin/compact?major=true'   # flush + compact this node
 curl -XPOST localhost:7001/admin/repair         # repair this node's primary ranges -> report
 curl localhost:7001/admin/repair                # last repair report
+curl -XPOST localhost:7002/admin/decommission   # leave the cluster, handing ranges over
+curl -XPOST localhost:7001/admin/removenode/n3  # remove a dead node
+curl -XPOST localhost:7001/admin/cleanup        # drop data for ranges this node no longer owns
 ```
 
 Errors: `400` bad request, `404` not found, `503` not enough live replicas
@@ -73,6 +81,7 @@ src/
   ring.rs         token ring (FNV-1a + splitmix64), vnodes, replica placement, ownership
   coordinator.rs  replicated write/read with consistency levels, hinted handoff,
                   read repair, two-phase scatter/gather find
+  movement.rs     bootstrap / decommission / removenode / cleanup, range streaming
   repair.rs       Merkle-tree anti-entropy repair (validation, tree diff, streaming), scheduler
   storage/
     mod.rs        LSM engine: memtable, flush/compaction worker, reads & scans
@@ -151,6 +160,39 @@ the document back after the tombstone is purged.
 The end-to-end test wipes a node's data directory, and repair rebuilds all of it from its peers.
 It also checks that a write and a delete that each reached only one replica get propagated.
 
+## Adding and removing nodes
+
+Nodes move through `JOINING → NORMAL → LEAVING → LEFT`, and the state travels in gossip.
+Every node keeps two rings. The **current** ring (NORMAL + LEAVING nodes) serves reads and
+counts write acknowledgements. The **future** ring (NORMAL + JOINING nodes) is what the ring
+will look like once the move finishes. A node that's in the future ring for a key but not the
+current one is a **pending replica**. It gets every write but doesn't count toward the
+consistency level, so writes made while data is moving aren't lost.
+
+Every move is built from one step, **pull**: a node copies token ranges from the live
+replicas that currently hold them, in pages over `/internal/stream`. It pulls from all live
+replicas and keeps the newest version of each key, so one stale replica can't leave it with
+old data.
+
+- **Join.** A node with an empty data directory starts as JOINING. If it finds an existing
+  cluster, it waits `--ring-delay-ms` for every node to start sending it writes. Then it
+  pulls the ranges it will own and switches to NORMAL. A `bootstrapped` marker file in its
+  data directory stops it from doing this again. Pass `--no-bootstrap` for the first nodes of
+  a brand-new cluster, or to rejoin in place after losing a disk (then run repair).
+- **Decommission** (`POST /admin/decommission` on the node that should leave). It goes
+  LEAVING, each new owner pulls the ranges it gains, then it goes LEFT and can be shut down.
+  If a pull fails, it goes back to NORMAL.
+- **Removenode** (`POST /admin/removenode/<id>`, for a node that is DOWN and not coming back).
+  The dead node is marked LEAVING on its behalf, so writes go to the new owners. The new
+  owners pull from the surviving replicas, then the dead node is marked LEFT.
+- **Cleanup** (`POST /admin/cleanup`). After a join, the old owners still have copies of data
+  they gave away. Cleanup rewrites their SSTables without it. It refuses while any node is
+  joining or leaving.
+
+Decommission and removenode refuse to run while another node is joining or leaving (`409`).
+Writes to a LEFT node's queue are dropped, and LEFT nodes don't count toward `find`'s
+`partial` flag.
+
 ## Simplifications (vs. the real things)
 
 - Fixed-timeout failure detector instead of phi-accrual. Gossip sends full state, not digests.
@@ -161,9 +203,12 @@ It also checks that a write and a delete that each reached only one replica get 
 - Repair rescans a replica's whole dataset each run. There are no incremental or
   per-SSTable repaired markers, and streamed data isn't paged, so one repair response holds
   all entries in the differing leaves.
-- No data streaming when nodes join or leave. A new node only gets data through new writes,
-  hints, and read repair. Changing the cluster under live data needs a repair this doesn't
-  implement.
+- Range movements copy from every live replica rather than picking one source. That's
+  simpler and keeps the newest data, but it moves up to RF times as much data. Tokens come
+  from the node id, so you can't choose or move tokens, and there's no "replace this dead
+  node" shortcut: use removenode, then join a fresh node.
+- A removed node that comes back with its old data dir rejoins as NORMAL with stale data.
+  Wipe its data dir first.
 - `find` is a full scatter/gather scan. There are no secondary indexes.
 - `PATCH` is read-modify-write and not atomic under concurrent updaters (LWW).
 - Inserts are upserts, as in Cassandra. A duplicate `_id` overwrites.
