@@ -490,7 +490,7 @@ mod tests {
     use serde_json::json;
 
     pub fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cassa-sst-{name}-{}", crate::model::now_micros()));
+        let d = std::env::temp_dir().join(format!("cassango-sst-{name}-{}", crate::model::now_micros()));
         fs::create_dir_all(&d).unwrap();
         d
     }

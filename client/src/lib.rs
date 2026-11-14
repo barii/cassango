@@ -1,8 +1,8 @@
-//! Async Rust driver for [cassa](https://github.com/), a distributed JSON document database
+//! Async Rust driver for [cassango](https://github.com/), a distributed JSON document database
 //! with Cassandra-style replication and MongoDB-style queries.
 //!
 //! ```no_run
-//! use cassa_client::{Client, Consistency, Filter, Update};
+//! use cassango_client::{Client, Consistency, Filter, Update};
 //! use serde::{Deserialize, Serialize};
 //! use serde_json::json;
 //!
@@ -15,7 +15,7 @@
 //!     city: String,
 //! }
 //!
-//! # async fn demo() -> cassa_client::Result<()> {
+//! # async fn demo() -> cassango_client::Result<()> {
 //! let client = Client::builder()
 //!     .hosts(["127.0.0.1:7001", "127.0.0.1:7002"]) // later hosts are fallbacks
 //!     .consistency(Consistency::Quorum)
@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-/// A handle to a cassa cluster. Cheap to clone; clones share connections and host state.
+/// A handle to a cassango cluster. Cheap to clone; clones share connections and host state.
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<Inner>,

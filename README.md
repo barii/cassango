@@ -1,4 +1,4 @@
-# cassa
+# cassango
 
 A small distributed JSON document database in Rust: **Cassandra-style distribution**
 with **MongoDB-style documents and queries**, plus a shell to talk to it.
@@ -16,7 +16,7 @@ with **MongoDB-style documents and queries**, plus a shell to talk to it.
 
 **Contents:**
 [Quick start](#quick-start) ·
-[The shell](#the-shell-cassa-cli) ·
+[The shell](#the-shell-cassango-cli) ·
 [Examples](#examples) ·
 [Scripting](#scripting) ·
 [Rust driver](#rust-driver) ·
@@ -29,16 +29,16 @@ with **MongoDB-style documents and queries**, plus a shell to talk to it.
 ## Quick start
 
 ```bash
-cargo build --release              # builds target/release/cassa and target/release/cassa-cli
+cargo build --release              # builds target/release/cassango and target/release/cassango-cli
 scripts/cluster.sh start 3         # 3 nodes on 127.0.0.1:7001..7003, replication factor 3
-target/release/cassa-cli           # open the shell (connects to 127.0.0.1:7001)
+target/release/cassango-cli           # open the shell (connects to 127.0.0.1:7001)
 ```
 
 ```text
-cassa shell — connected to 127.0.0.1:7001 (consistency quorum). Type 'help' for examples, 'exit' to quit.
-cassa 127.0.0.1:7001> db.users.insert({_id: "ann", name: "Ann Lee", age: 31, city: "Leeds"})
+cassango shell — connected to 127.0.0.1:7001 (consistency quorum). Type 'help' for examples, 'exit' to quit.
+cassango 127.0.0.1:7001> db.users.insert({_id: "ann", name: "Ann Lee", age: 31, city: "Leeds"})
 inserted 1 document, _id: ann (4 ms)
-cassa 127.0.0.1:7001> db.users.find({age: {$gt: 30}})
+cassango 127.0.0.1:7001> db.users.find({age: {$gt: 30}})
 {
   "_id": "ann",
   "name": "Ann Lee",
@@ -46,7 +46,7 @@ cassa 127.0.0.1:7001> db.users.find({age: {$gt: 30}})
   "city": "Leeds"
 }
 1 of 1 matching document (3 ms)
-cassa 127.0.0.1:7001> show cluster
+cassango 127.0.0.1:7001> show cluster
 node   address         status  state   ownership_%  last_seen_s
 -----  --------------  ------  ------  -----------  -----------
 node1  127.0.0.1:7001  UP      NORMAL  33.28        0.0
@@ -58,27 +58,27 @@ coordinator node1 · RF 3 · pending hints 0 · range movements in progress: fal
 To try every example in this README at once, run the tour script:
 
 ```bash
-target/release/cassa-cli -o table -f examples/tour.cassa
+target/release/cassango-cli -o table -f examples/tour.cassango
 ```
 
 When you're done, `scripts/cluster.sh stop` stops the nodes and `scripts/cluster.sh clean`
 also deletes their data.
 
-## The shell (cassa-cli)
+## The shell (cassango-cli)
 
 ```bash
-cassa-cli                                         # interactive shell with history (~/.cassa_history)
-cassa-cli -e 'db.users.count()'                   # run one statement and exit
-cassa-cli -e 'db.a.insert({x: 1})' -e 'db.a.count()'   # several statements
-cassa-cli -f examples/tour.cassa                  # run a script file
-echo 'db.users.find({city: "York"})' | cassa-cli  # read statements from stdin
-cassa-cli -H 10.0.0.5:7001,10.0.0.6:7001          # fall back to the second host if the first is down
-CASSA_HOST=10.0.0.5:7001 cassa-cli                # host from the environment
+cassango-cli                                         # interactive shell with history (~/.cassango_history)
+cassango-cli -e 'db.users.count()'                   # run one statement and exit
+cassango-cli -e 'db.a.insert({x: 1})' -e 'db.a.count()'   # several statements
+cassango-cli -f examples/tour.cassango                  # run a script file
+echo 'db.users.find({city: "York"})' | cassango-cli  # read statements from stdin
+cassango-cli -H 10.0.0.5:7001,10.0.0.6:7001          # fall back to the second host if the first is down
+CASSANGO_HOST=10.0.0.5:7001 cassango-cli                # host from the environment
 ```
 
 | Flag | Meaning |
 |---|---|
-| `-H, --host <list>` | Nodes to talk to, comma-separated; later ones are used if earlier ones are unreachable. Default `127.0.0.1:7001`, or `$CASSA_HOST`. |
+| `-H, --host <list>` | Nodes to talk to, comma-separated; later ones are used if earlier ones are unreachable. Default `127.0.0.1:7001`, or `$CASSANGO_HOST`. |
 | `-e, --execute <stmt>` | Run a statement (repeatable), then exit. |
 | `-f, --file <path>` | Run a script file, then exit. |
 | `-c, --consistency <cl>` | `one`, `quorum` (default) or `all`. |
@@ -133,7 +133,7 @@ CASSA_HOST=10.0.0.5:7001 cassa-cli                # host from the environment
 
 ## Examples
 
-All of these come from [`examples/tour.cassa`](examples/tour.cassa); outputs are shown with
+All of these come from [`examples/tour.cassango`](examples/tour.cassango); outputs are shown with
 `format table`.
 
 ### Inserting
@@ -354,17 +354,17 @@ db.users.get("ann").consistency("all")            // just this statement
 With one node down, `quorum` (2 of 3) and `one` still work; `all` fails fast:
 
 ```text
-cassa 127.0.0.1:7001> show cluster
+cassango 127.0.0.1:7001> show cluster
 node   address         status  state   ownership_%  last_seen_s
 -----  --------------  ------  ------  -----------  -----------
 node1  127.0.0.1:7001  UP      NORMAL  33.28        0.0
 node2  127.0.0.1:7002  DOWN    NORMAL  28.99        3.6
 node3  127.0.0.1:7003  UP      NORMAL  37.73        0.1
 
-cassa 127.0.0.1:7001> db.users.get("ann").consistency("all")
+cassango 127.0.0.1:7001> db.users.get("ann").consistency("all")
 error: 503 unavailable: 3 replicas required but only 2 alive
 
-cassa 127.0.0.1:7001> db.users.find({city: "Leeds"})
+cassango 127.0.0.1:7001> db.users.find({city: "Leeds"})
 ...
 3 of 3 matching documents — PARTIAL: some nodes were unreachable
 ```
@@ -391,7 +391,7 @@ node1    true
 Script files hold the same statements you'd type in the shell:
 
 ```js
-// seed.cassa
+// seed.cassango
 db.users.insertMany([
   {_id: "ann", name: "Ann", city: "Leeds"},
   {_id: "bob", name: "Bob", city: "York"},
@@ -401,32 +401,32 @@ db.users.count()
 ```
 
 ```bash
-cassa-cli -f seed.cassa                     # stops at the first error, exit code 1
-cassa-cli -f seed.cassa --continue-on-error # keep going; exit code 1 if anything failed
+cassango-cli -f seed.cassango                     # stops at the first error, exit code 1
+cassango-cli -f seed.cassango --continue-on-error # keep going; exit code 1 if anything failed
 ```
 
 With `-o json`, output is JSON Lines with no status messages, so it pipes cleanly:
 
 ```bash
-$ cassa-cli -o json -e 'db.people.find({age: {$gte: 89}}).sort({age: -1}).limit(3)' | jq -c '{name, age}'
+$ cassango-cli -o json -e 'db.people.find({age: {$gte: 89}}).sort({age: -1}).limit(3)' | jq -c '{name, age}'
 {"name":"user1319","age":90}
 {"name":"user200","age":90}
 {"name":"user108","age":90}
 
-$ cassa-cli -o json -e 'db.users.count({city: "Leeds"})'
+$ cassango-cli -o json -e 'db.users.count({city: "Leeds"})'
 2
 
 # Export a collection, one document per line
-$ cassa-cli -o json -e 'db.users.find({})' > users.jsonl
+$ cassango-cli -o json -e 'db.users.find({})' > users.jsonl
 
 # Import it into another collection
-$ jq -c '. | del(._id)' users.jsonl | while read -r doc; do echo "db.users_copy.insert($doc)"; done | cassa-cli
+$ jq -c '. | del(._id)' users.jsonl | while read -r doc; do echo "db.users_copy.insert($doc)"; done | cassango-cli
 ```
 
 Heredocs work too:
 
 ```bash
-cassa-cli <<'EOF'
+cassango-cli <<'EOF'
 db.orders.insert({_id: "o1", user: "ann", total: 42.5, items: ["p1", "p5"]})
 db.orders.find({total: {$gt: 40}})
 EOF
@@ -437,15 +437,15 @@ Exit codes: `0` success, `1` a statement failed (bad syntax, server error, unrea
 
 ## Rust driver
 
-[`client/`](client/README.md) is an async driver (`cassa-client`) for using cassa from Rust:
+[`client/`](client/README.md) is an async driver (`cassango-client`) for using cassango from Rust:
 
 ```toml
 [dependencies]
-cassa-client = { path = "../cassa/client" }
+cassango-client = { path = "../cassa/client" }
 ```
 
 ```rust
-use cassa_client::{Client, Filter, Order, Update};
+use cassango_client::{Client, Filter, Order, Update};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -459,7 +459,7 @@ struct User {
 }
 
 #[tokio::main]
-async fn main() -> cassa_client::Result<()> {
+async fn main() -> cassango_client::Result<()> {
     let client = Client::builder().hosts(["127.0.0.1:7001", "127.0.0.1:7002"]).build()?;
     let users = client.collection::<User>("users");
 
@@ -484,7 +484,7 @@ It covers everything the shell does: typed or schemaless (`serde_json::Value`) c
 `find` with sort/skip/limit/explain, `count`, `update_many`/`delete_many`, indexes, consistency
 per collection handle, cluster info, typed errors, and moving to the next host when one is down.
 See the [driver README](client/README.md) for the full API, and run the example with
-`cargo run -p cassa-client --example quickstart`.
+`cargo run -p cassango-client --example quickstart`.
 
 ## Operating a cluster
 
@@ -509,12 +509,12 @@ A walkthrough using the shell:
 ```bash
 # 1. A node fails. Writes keep working at quorum and are queued for it.
 scripts/cluster.sh kill 2
-cassa-cli -e 'db.users.insert({_id: "zed", name: "Zed"})'
-cassa-cli -e 'show cluster'          # a few seconds later: node2 DOWN, "pending hints 1"
+cassango-cli -e 'db.users.insert({_id: "zed", name: "Zed"})'
+cassango-cli -e 'show cluster'          # a few seconds later: node2 DOWN, "pending hints 1"
 
 # 2. It comes back. The queued writes are delivered within a few seconds.
 scripts/cluster.sh restart 2
-cassa-cli -e 'show cluster'          # node2 UP, "pending hints 0"
+cassango-cli -e 'show cluster'          # node2 UP, "pending hints 0"
 
 # 3. Make sure all replicas agree (e.g. after a long outage). Run on every node.
 scripts/cluster.sh repair
@@ -523,7 +523,7 @@ scripts/cluster.sh repair
 
 # 4. Grow the cluster. node4 starts as JOINING, streams its ranges, then turns NORMAL.
 scripts/cluster.sh join 4
-cassa-cli -e 'show cluster'          # node4 JOINING ... then NORMAL
+cassango-cli -e 'show cluster'          # node4 JOINING ... then NORMAL
 scripts/cluster.sh cleanup           # free the space the old owners no longer need
 
 # 5. Shrink it again.
@@ -533,11 +533,11 @@ scripts/cluster.sh decommission 4    # streams node4's data away, marks it LEFT,
 Maintenance on a single node from the shell:
 
 ```text
-cassa 127.0.0.1:7001> repair
+cassango 127.0.0.1:7001> repair
 repair on node1: 16 ranges, 16 in sync, 0 repaired, 0 skipped, 0 entries streamed (31 ms)
-cassa 127.0.0.1:7001> compact major
+cassango 127.0.0.1:7001> compact major
 compacted 3 sstables; 1 now on disk (52 ms)
-cassa 127.0.0.1:7001> cleanup
+cassango 127.0.0.1:7001> cleanup
 cleanup dropped 0 entries (12 ms)
 ```
 
@@ -640,8 +640,8 @@ src/
     secondary.rs  index key encoding (order-preserving) and query planner
   query.rs        filter matching, validation, sorting, update operators
   api.rs          axum HTTP API (public + /internal/* node-to-node)
-  bin/cassa-cli/  the shell: statement parser, HTTP client, output formatting
-client/           cassa-client, the async Rust driver (its own crate in the workspace)
+  bin/cassango-cli/  the shell: statement parser, HTTP client, output formatting
+client/           cassango-client, the async Rust driver (its own crate in the workspace)
 tests/driver.rs   driver integration tests against a real server process
 ```
 

@@ -1,4 +1,4 @@
-//! cassa — a small distributed JSON document database.
+//! cassango — a small distributed JSON document database.
 //!
 //! Cassandra-style distribution (gossip membership, consistent-hash ring with vnodes,
 //! tunable consistency, hinted handoff, read repair, LWW conflict resolution) with
@@ -22,7 +22,7 @@ use std::time::Duration;
 use tracing::info;
 
 #[derive(Parser, Debug)]
-#[command(name = "cassa", version, about = "Distributed JSON document database (gossip + consistent hashing)")]
+#[command(name = "cassango", version, about = "Distributed JSON document database (gossip + consistent hashing)")]
 struct Args {
     /// Unique, stable node id. Determines this node's ring tokens.
     #[arg(long)]
@@ -157,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     info!(node = %args.node_id, listen = %args.listen, advertise = %advertise, seeds = ?args.seeds,
-          rf = args.replication_factor, state = ?status, "cassa node started");
+          rf = args.replication_factor, state = ?status, "cassango node started");
 
     axum::serve(listener, api::router(node))
         .with_graceful_shutdown(async {

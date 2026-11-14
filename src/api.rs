@@ -107,7 +107,7 @@ fn with_id(doc: Value, id: &str) -> ApiResult<Value> {
 
 async fn info(State(n): State<AppState>) -> Json<Value> {
     Json(json!({
-        "name": "cassa",
+        "name": "cassango",
         "version": env!("CARGO_PKG_VERSION"),
         "node_id": n.id,
         "state": n.gossip.my_status(),

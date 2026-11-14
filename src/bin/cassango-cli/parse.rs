@@ -1,4 +1,4 @@
-//! Statement parser for the cassa shell.
+//! Statement parser for the cassango shell.
 //!
 //! Two kinds of statements:
 //!

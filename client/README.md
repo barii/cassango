@@ -1,10 +1,10 @@
-# cassa-client
+# cassango-client
 
-Async Rust driver for [cassa](../README.md), the distributed JSON document database.
+Async Rust driver for [cassango](../README.md), the distributed JSON document database.
 
 ```toml
 [dependencies]
-cassa-client = { path = "path/to/cassa/client" }        # or: git = "https://…/cassa", package = "cassa-client"
+cassango-client = { path = "path/to/cassa/client" }        # or: git = "https://…/cassango", package = "cassango-client"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -16,7 +16,7 @@ futures, and on nothing from the server.
 ## Connecting
 
 ```rust
-use cassa_client::{Client, Consistency};
+use cassango_client::{Client, Consistency};
 use std::time::Duration;
 
 let client = Client::new("127.0.0.1:7001")?;                  // one host, defaults
@@ -113,7 +113,7 @@ if r.partial { /* some nodes were unreachable; results may be incomplete */ }
 or with the `Filter` builder:
 
 ```rust
-use cassa_client::{Filter, Order};
+use cassango_client::{Filter, Order};
 
 let leeds_adults = users
     .find(Filter::new().eq("city", "Leeds").gte("age", 18))
@@ -138,7 +138,7 @@ the same field are merged, so `.gte("age", 18).lt("age", 65)` becomes
 ### Updates and deletes
 
 ```rust
-use cassa_client::Update;
+use cassango_client::Update;
 
 let bob = users.update("bob", Update::new()
         .set("addr.city", "Leeds")      // dotted paths create nested objects
@@ -184,7 +184,7 @@ match strict.get("ann").await {
 
 ### Errors
 
-All methods return `cassa_client::Result<T>`, an alias for `Result<T, cassa_client::Error>`:
+All methods return `cassango_client::Result<T>`, an alias for `Result<T, cassango_client::Error>`:
 
 | Variant | When |
 |---|---|
@@ -215,7 +215,7 @@ let node = client.ping().await?;   // node_id, version, state, replication_facto
 
 ```bash
 scripts/cluster.sh start 3
-cargo run -p cassa-client --example quickstart
+cargo run -p cassango-client --example quickstart
 ```
 
 ## Notes

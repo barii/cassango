@@ -334,32 +334,32 @@ r=$(q 7001 bulk '{"filter":{"bucket":7},"explain":true}' "$plan")
 code=$(curl -s -o /dev/null -w '%{http_code}' -XDELETE $N3/collections/bulk/indexes/bucket)
 [[ $code == 404 ]] && ok "dropping again is 404" || fail "second drop: $code"
 
-echo "cassa-cli"
-CLI="target/release/cassa-cli -H 127.0.0.1:7001"
+echo "cassango-cli"
+CLI="target/release/cassango-cli -H 127.0.0.1:7001"
 r=$($CLI -o json -e 'db.cli.insert({_id: "a", n: 1, tags: ["x"]})' -e "db.cli.insert({_id: 'b', n: 2})" -e 'db.cli.count()' | tail -1)
 [[ $r == 2 ]] && ok "cli: JSON5 inserts and count via -e" || fail "cli count: $r"
 script=$(mktemp)
-cat > "$script" <<'CASSA'
+cat > "$script" <<'CASSANGO'
 // multi-line statements and comments
 db.cli.update("a", {
   $inc: {n: 10},
   $push: {tags: "y"},
 })
 db.cli.find({n: {$gt: 5}})
-CASSA
+CASSANGO
 r=$($CLI -o json -f "$script" | tail -1 | j "(d['_id'], d['n'], d['tags'])")
 [[ $r == "('a', 11, ['x', 'y'])" ]] && ok "cli: script file with multi-line statements: $r" || fail "cli script: $r"
 r=$(echo 'db.cli.find({}).sort({n: -1}).limit(1)' | $CLI -o json | j "d['_id']")
 [[ $r == a ]] && ok "cli: statements from stdin" || fail "cli stdin: $r"
 code=0; $CLI -e 'db.cli.find({n: {$bogus: 1}})' >/dev/null 2>&1 || code=$?
 [[ $code == 1 ]] && ok "cli: server errors give exit code 1" || fail "cli exit code: $code"
-r=$(target/release/cassa-cli -H 127.0.0.1:7999,127.0.0.1:7003 -o json -e 'db.cli.get("b")' 2>/dev/null | j "d['n']")
+r=$(target/release/cassango-cli -H 127.0.0.1:7999,127.0.0.1:7003 -o json -e 'db.cli.get("b")' 2>/dev/null | j "d['n']")
 [[ $r == 2 ]] && ok "cli: fails over to the next host" || fail "cli failover: $r"
 r=$($CLI -o table -e 'db.cli.find({}).sort({_id: 1})' | head -1 | tr -s ' ')
 [[ $r == "_id n tags" ]] && ok "cli: table output" || fail "cli table header: $r"
 
 echo "rust driver"
-out=$(CASSA_HOST=127.0.0.1:7001,127.0.0.1:7003 cargo run -q -p cassa-client --example quickstart 2>&1) \
+out=$(CASSANGO_HOST=127.0.0.1:7001,127.0.0.1:7003 cargo run -q -p cassango-client --example quickstart 2>&1) \
   && [[ $out == *"in stock under £30 (3 of 3)"* && $out == *"bad query rejected"* ]] \
   && ok "driver quickstart example runs against the cluster" || fail "driver example: $out"
 

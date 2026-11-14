@@ -4,7 +4,7 @@
 //! you can use `serde_json::json!` directly or these builders, whichever reads better:
 //!
 //! ```
-//! use cassa_client::{Filter, Update};
+//! use cassango_client::{Filter, Update};
 //! use serde_json::json;
 //!
 //! let a = Filter::new().eq("city", "Leeds").gte("age", 18).lt("age", 65);

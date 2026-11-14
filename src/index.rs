@@ -75,7 +75,7 @@ impl IndexManager {
         let (tx, rx) = mpsc::channel();
         let mgr = Arc::new(IndexManager { path, storage, state: Mutex::new(state), jobs: tx });
         let worker = Arc::downgrade(&mgr);
-        std::thread::Builder::new().name("cassa-index".into()).spawn(move || {
+        std::thread::Builder::new().name("cassango-index".into()).spawn(move || {
             for job in rx {
                 let Some(mgr) = worker.upgrade() else { return };
                 mgr.run(job);

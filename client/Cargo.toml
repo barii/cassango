@@ -1,8 +1,8 @@
 [package]
-name = "cassa-client"
+name = "cassango-client"
 version = "0.1.0"
 edition = "2024"
-description = "Async Rust driver for the cassa distributed document database"
+description = "Async Rust driver for the cassango distributed document database"
 license = "MIT"
 
 [dependencies]

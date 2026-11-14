@@ -1,7 +1,7 @@
-// A tour of cassa. Run it against a running cluster:
+// A tour of cassango. Run it against a running cluster:
 //
 //   scripts/cluster.sh start 3
-//   target/release/cassa-cli -f examples/tour.cassa
+//   target/release/cassango-cli -f examples/tour.cassango
 //
 // Statements may span lines; '//', '#' and '--' start comments.
 

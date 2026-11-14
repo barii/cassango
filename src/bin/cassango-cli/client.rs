@@ -1,4 +1,4 @@
-//! HTTP client for a cassa cluster, with failover across the given hosts.
+//! HTTP client for a cassango cluster, with failover across the given hosts.
 
 use reqwest::blocking::Client as Http;
 use reqwest::{Method, StatusCode};

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a local cassa cluster.
+# Run a local cassango cluster.
 #
 #   scripts/cluster.sh start [N]     start N nodes (default 3) on ports 7001..
 #   scripts/cluster.sh stop          stop all nodes
@@ -15,7 +15,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=target/release/cassa
+BIN=target/release/cassango
 BASE_PORT=7000
 SEEDS="127.0.0.1:7001,127.0.0.1:7002"
 RF=${RF:-3}

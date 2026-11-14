@@ -1,0 +1,106 @@
+# A 6-node cassango cluster (replication factor 3):
+#   docker build -t cassango:latest .      # build the image once
+#   docker compose up -d
+#   target/release/cassango-cli -H 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003
+# Node N is published on host port 700N (container port 7000).
+x-cassango-node: &node
+  image: cassango:latest
+  restart: unless-stopped
+  stop_signal: SIGINT          # graceful shutdown flushes the memtable
+  stop_grace_period: 30s
+  networks: [cassango]
+  healthcheck:
+    test: ["CMD", "cassango-cli", "-H", "127.0.0.1:7000", "-o", "json", "-e", "show cluster"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+
+services:
+  cassango1:
+    <<: *node
+    hostname: cassango1
+    command: [
+      "--node-id", "cassango1",
+      "--advertise", "cassango1:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7001:7000"]
+    volumes: ["cassango1-data:/data"]
+
+  cassango2:
+    <<: *node
+    hostname: cassango2
+    command: [
+      "--node-id", "cassango2",
+      "--advertise", "cassango2:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7002:7000"]
+    volumes: ["cassango2-data:/data"]
+
+  cassango3:
+    <<: *node
+    hostname: cassango3
+    command: [
+      "--node-id", "cassango3",
+      "--advertise", "cassango3:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7003:7000"]
+    volumes: ["cassango3-data:/data"]
+
+  cassango4:
+    <<: *node
+    hostname: cassango4
+    command: [
+      "--node-id", "cassango4",
+      "--advertise", "cassango4:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7004:7000"]
+    volumes: ["cassango4-data:/data"]
+
+  cassango5:
+    <<: *node
+    hostname: cassango5
+    command: [
+      "--node-id", "cassango5",
+      "--advertise", "cassango5:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7005:7000"]
+    volumes: ["cassango5-data:/data"]
+
+  cassango6:
+    <<: *node
+    hostname: cassango6
+    command: [
+      "--node-id", "cassango6",
+      "--advertise", "cassango6:7000",
+      "--seeds", "cassango1:7000,cassango2:7000,cassango3:7000",
+      "--replication-factor", "3",
+      "--repair-interval-secs", "86400",
+    ]
+    ports: ["7006:7000"]
+    volumes: ["cassango6-data:/data"]
+
+networks:
+  cassango: {}
+
+volumes:
+  cassango1-data: {}
+  cassango2-data: {}
+  cassango3-data: {}
+  cassango4-data: {}
+  cassango5-data: {}
+  cassango6-data: {}

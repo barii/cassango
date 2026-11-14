@@ -273,7 +273,7 @@ impl Storage {
         let (tx, rx) = mpsc::channel();
         let worker_shared = shared.clone();
         std::thread::Builder::new()
-            .name("cassa-storage".into())
+            .name("cassango-storage".into())
             .spawn(move || worker(worker_shared, rx))?;
         for f in frozen {
             let _ = tx.send(Job::Flush(f));
@@ -822,7 +822,7 @@ mod tests {
     use serde_json::json;
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("cassa-store-{name}-{}", now_micros()));
+        let d = std::env::temp_dir().join(format!("cassango-store-{name}-{}", now_micros()));
         let _ = fs::remove_dir_all(&d);
         d
     }

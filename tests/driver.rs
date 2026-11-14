@@ -1,6 +1,6 @@
-//! Integration tests for the `cassa-client` driver against a real `cassa` server process.
+//! Integration tests for the `cassango-client` driver against a real `cassango` server process.
 
-use cassa_client::{Client, Consistency, Error, Filter, Order, Update};
+use cassango_client::{Client, Consistency, Error, Filter, Order, Update};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::net::TcpListener;
@@ -19,9 +19,9 @@ impl Server {
     async fn start() -> Server {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
-        let dir = std::env::temp_dir().join(format!("cassa-driver-test-{port}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cassango-driver-test-{port}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let child = Command::new(env!("CARGO_BIN_EXE_cassa"))
+        let child = Command::new(env!("CARGO_BIN_EXE_cassango"))
             .args(["--node-id", "t1", "--listen", &addr, "--seeds", &addr, "--no-bootstrap"])
             .args(["--replication-factor", "1", "--gossip-interval-ms", "200", "--ring-delay-ms", "200"])
             .arg("--data-dir")
@@ -29,7 +29,7 @@ impl Server {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start cassa");
+            .expect("start cassango");
         let server = Server { child, addr, dir };
         let client = Client::new(&server.addr).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -128,6 +128,41 @@ async fn typed_crud_queries_and_indexes() {
     assert!(info.members[0].is_up());
     assert_eq!(users.owners("ann").await.unwrap()[0].node_id, "t1");
     assert_eq!(client.ping().await.unwrap().state, "NORMAL");
+}
+
+/// Every driver future must be `Send`, so services can run them in `tokio::spawn`.
+#[tokio::test]
+async fn futures_can_be_spawned() {
+    let server = Server::start().await;
+    let users = Client::new(&server.addr).unwrap().collection::<User>("spawned");
+    let ids = tokio::spawn({
+        let users = users.clone();
+        async move { users.insert_many(&[user("a", 30, "Leeds"), user("b", 40, "York")]).await }
+    });
+    assert_eq!(ids.await.unwrap().unwrap(), vec!["a", "b"]);
+    let updated = tokio::spawn({
+        let users = users.clone();
+        async move { users.update_many(json!({}), Update::new().inc("age", 1)).await }
+    });
+    assert_eq!(updated.await.unwrap().unwrap(), 2);
+    let found = tokio::spawn({
+        let users = users.clone();
+        async move { users.find(json!({"age": {"$gt": 35}})).await }
+    });
+    assert_eq!(found.await.unwrap().unwrap().matched, 1);
+    let deleted = tokio::spawn({
+        let users = users.clone();
+        async move { users.delete_many(json!({})).await }
+    });
+    assert_eq!(deleted.await.unwrap().unwrap(), 2);
+    let waited = tokio::spawn({
+        let users = users.clone();
+        async move {
+            users.create_index("age").await?;
+            users.wait_for_index("age", Duration::from_secs(10)).await
+        }
+    });
+    waited.await.unwrap().unwrap();
 }
 
 #[tokio::test]

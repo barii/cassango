@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn append_replay_and_torn_tail() {
-        let dir = std::env::temp_dir().join(format!("cassa-cl-{}", crate::model::now_micros()));
+        let dir = std::env::temp_dir().join(format!("cassango-cl-{}", crate::model::now_micros()));
         fs::create_dir_all(&dir).unwrap();
         {
             let mut log = CommitLog::create(&dir, 7, false).unwrap();

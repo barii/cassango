@@ -99,7 +99,10 @@ where
     /// Insert a document and return its `_id` (generated if the document has none).
     /// Like Cassandra, this is an upsert: an existing document with the same `_id` is replaced.
     pub async fn insert(&self, doc: &T) -> Result<String> {
-        let body = serde_json::to_value(doc)?;
+        self.insert_body(serde_json::to_value(doc)?).await
+    }
+
+    async fn insert_body(&self, body: Value) -> Result<String> {
         let r = self.client.call(Method::POST, &self.docs_path(), Some(self.consistency), Some(&body)).await?;
         r["_id"].as_str().map(str::to_string).ok_or_else(|| Error::Transport(format!("unexpected response: {r}")))
     }
@@ -107,7 +110,17 @@ where
     /// Insert many documents concurrently. Returns their ids in input order.
     /// Stops at the first error; documents already sent stay inserted.
     pub async fn insert_many(&self, docs: &[T]) -> Result<Vec<String>> {
-        futures::stream::iter(docs).map(|d| self.insert(d)).buffered(CONCURRENCY).try_collect().await
+        // Each concurrent request owns its data (no borrows inside the stream), which keeps
+        // the returned future `Send` so callers can `tokio::spawn` it.
+        let bodies = docs.iter().map(serde_json::to_value).collect::<Result<Vec<Value>, _>>()?;
+        futures::stream::iter(bodies)
+            .map(|body| {
+                let coll = self.clone();
+                async move { coll.insert_body(body).await }
+            })
+            .buffered(CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Insert or replace the document with this id.
@@ -188,10 +201,10 @@ where
         let ids = self.matching_ids(filter.into()).await?;
         let update = update.into();
         let raw = self.typed::<Value>();
-        let updated: Vec<bool> = futures::stream::iter(&ids)
+        let updated: Vec<bool> = futures::stream::iter(ids)
             .map(|id| {
-                let (raw, update) = (&raw, update.clone());
-                async move { raw.update(id, update).await.map(|d| d.is_some()) }
+                let (raw, update) = (raw.clone(), update.clone());
+                async move { raw.update(&id, update).await.map(|d| d.is_some()) }
             })
             .buffer_unordered(CONCURRENCY)
             .try_collect()
@@ -203,8 +216,16 @@ where
     /// [`Collection::update_many`].
     pub async fn delete_many(&self, filter: impl Into<Value>) -> Result<usize> {
         let ids = self.matching_ids(filter.into()).await?;
-        futures::stream::iter(&ids).map(|id| self.delete(id)).buffer_unordered(CONCURRENCY).try_collect::<Vec<()>>().await?;
-        Ok(ids.len())
+        let count = ids.len();
+        futures::stream::iter(ids)
+            .map(|id| {
+                let coll = self.clone();
+                async move { coll.delete(&id).await }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await?;
+        Ok(count)
     }
 
     /// Create a secondary index on a (dotted) field. Returns `false` if it already

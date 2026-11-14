@@ -1,11 +1,11 @@
-//! Quick tour of the cassa Rust driver.
+//! Quick tour of the cassango Rust driver.
 //!
 //!   scripts/cluster.sh start 3
-//!   cargo run -p cassa-client --example quickstart
+//!   cargo run -p cassango-client --example quickstart
 //!
-//! Set CASSA_HOST to point at other nodes (comma-separated).
+//! Set CASSANGO_HOST to point at other nodes (comma-separated).
 
-use cassa_client::{Client, Consistency, Error, Filter, Order, Update};
+use cassango_client::{Client, Consistency, Error, Filter, Order, Update};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -28,7 +28,7 @@ fn product(sku: &str, name: &str, price: f64, stock: u32, category: &str) -> Pro
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let hosts = std::env::var("CASSA_HOST").unwrap_or_else(|_| "127.0.0.1:7001,127.0.0.1:7002".into());
+    let hosts = std::env::var("CASSANGO_HOST").unwrap_or_else(|_| "127.0.0.1:7001,127.0.0.1:7002".into());
     let client = Client::builder()
         .hosts(hosts.split(','))
         .consistency(Consistency::Quorum)

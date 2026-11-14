@@ -1,10 +1,10 @@
-//! cassa-cli: an interactive shell and scripting tool for cassa.
+//! cassango-cli: an interactive shell and scripting tool for cassango.
 //!
 //! ```text
-//! cassa-cli                                   interactive shell (history, multi-line input)
-//! cassa-cli -e 'db.users.find({age: 31})'     run statements and exit
-//! cassa-cli -f setup.cassa                    run a script file
-//! echo 'db.users.count()' | cassa-cli         read statements from stdin
+//! cassango-cli                                   interactive shell (history, multi-line input)
+//! cassango-cli -e 'db.users.find({age: 31})'     run statements and exit
+//! cassango-cli -f setup.cassango                    run a script file
+//! echo 'db.users.count()' | cassango-cli         read statements from stdin
 //! ```
 
 mod client;
@@ -21,10 +21,10 @@ use std::io::{BufRead, IsTerminal};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "cassa-cli", version, about = "Shell for the cassa distributed document database")]
+#[command(name = "cassango-cli", version, about = "Shell for the cassango distributed document database")]
 struct Args {
     /// Node(s) to talk to, comma-separated. Later ones are used if earlier ones are down.
-    #[arg(long, short = 'H', env = "CASSA_HOST", value_delimiter = ',', default_value = "127.0.0.1:7001")]
+    #[arg(long, short = 'H', env = "CASSANGO_HOST", value_delimiter = ',', default_value = "127.0.0.1:7001")]
     host: Vec<String>,
 
     /// Statement to execute (repeatable). Exits afterwards.
@@ -99,14 +99,14 @@ impl Shell {
 
     fn repl(&mut self) {
         let mut rl = rustyline::DefaultEditor::new().unwrap_or_else(|e| die(&e.to_string()));
-        let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cassa_history"));
+        let history = std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cassango_history"));
         if let Some(h) = &history {
             let _ = rl.load_history(h);
         }
-        println!("cassa shell — connected to {} (consistency {}). Type 'help' for examples, 'exit' to quit.", self.client.host(), self.client.consistency);
+        println!("cassango shell — connected to {} (consistency {}). Type 'help' for examples, 'exit' to quit.", self.client.host(), self.client.consistency);
         let mut buf = String::new();
         loop {
-            let prompt = if buf.is_empty() { format!("cassa {}> ", self.client.host()) } else { "   ...> ".to_string() };
+            let prompt = if buf.is_empty() { format!("cassango {}> ", self.client.host()) } else { "   ...> ".to_string() };
             match rl.readline(&prompt) {
                 Ok(raw) => {
                     if buf.is_empty() && (raw.trim().is_empty() || is_comment(&raw)) {
