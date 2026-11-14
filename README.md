@@ -11,6 +11,7 @@ with **MongoDB-style documents and queries**, plus a shell to talk to it.
 | Last-write-wins timestamps, tombstones, gc_grace | Update operators: `$set $unset $inc $push` |
 | Hinted handoff, read repair, Merkle-tree anti-entropy repair | Secondary indexes (equality, `$in`, ranges, multikey arrays) |
 | Node lifecycle: bootstrap, decommission, removenode, cleanup | A `mongo`-style shell: `db.users.find({age: {$gt: 30}})` |
+| | An async Rust driver with typed collections |
 | LSM storage: commit log → memtable → SSTables, bloom filters, size-tiered compaction | |
 
 **Contents:**
@@ -18,6 +19,7 @@ with **MongoDB-style documents and queries**, plus a shell to talk to it.
 [The shell](#the-shell-cassa-cli) ·
 [Examples](#examples) ·
 [Scripting](#scripting) ·
+[Rust driver](#rust-driver) ·
 [Operating a cluster](#operating-a-cluster) ·
 [HTTP API](#http-api) ·
 [Server flags](#running-the-server) ·
@@ -433,6 +435,57 @@ EOF
 Exit codes: `0` success, `1` a statement failed (bad syntax, server error, unreachable cluster),
 `2` bad command-line flags.
 
+## Rust driver
+
+[`client/`](client/README.md) is an async driver (`cassa-client`) for using cassa from Rust:
+
+```toml
+[dependencies]
+cassa-client = { path = "../cassa/client" }
+```
+
+```rust
+use cassa_client::{Client, Filter, Order, Update};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct User {
+    #[serde(rename = "_id")]
+    id: String,
+    name: String,
+    age: u32,
+    city: String,
+}
+
+#[tokio::main]
+async fn main() -> cassa_client::Result<()> {
+    let client = Client::builder().hosts(["127.0.0.1:7001", "127.0.0.1:7002"]).build()?;
+    let users = client.collection::<User>("users");
+
+    users.insert(&User { id: "ann".into(), name: "Ann".into(), age: 31, city: "Leeds".into() }).await?;
+    let ann: Option<User> = users.get("ann").await?;
+
+    let leeds = users
+        .find(Filter::new().eq("city", "Leeds").gte("age", 18))   // or json!({...})
+        .sort_by("age", Order::Desc)
+        .limit(10)
+        .await?;
+    println!("{} of {} matches", leeds.docs.len(), leeds.matched);
+
+    users.update("ann", Update::new().inc("age", 1)).await?;
+    let n = users.count(json!({"age": {"$gte": 18}})).await?;
+    users.delete("ann").await?;
+    Ok(())
+}
+```
+
+It covers everything the shell does: typed or schemaless (`serde_json::Value`) collections,
+`find` with sort/skip/limit/explain, `count`, `update_many`/`delete_many`, indexes, consistency
+per collection handle, cluster info, typed errors, and moving to the next host when one is down.
+See the [driver README](client/README.md) for the full API, and run the example with
+`cargo run -p cassa-client --example quickstart`.
+
 ## Operating a cluster
 
 `scripts/cluster.sh` runs a local cluster under `data/` and `logs/`:
@@ -588,6 +641,8 @@ src/
   query.rs        filter matching, validation, sorting, update operators
   api.rs          axum HTTP API (public + /internal/* node-to-node)
   bin/cassa-cli/  the shell: statement parser, HTTP client, output formatting
+client/           cassa-client, the async Rust driver (its own crate in the workspace)
+tests/driver.rs   driver integration tests against a real server process
 ```
 
 **Write path:** the coordinator timestamps the mutation, finds the `RF` replicas on the ring,
@@ -744,8 +799,9 @@ still asks every node, but each node does an index lookup instead of scanning th
 ## Development
 
 ```bash
-cargo test                  # unit tests (storage, ring, gossip, repair, indexes, shell parser)
-cargo clippy --all-targets  # no warnings
+cargo test --workspace      # unit tests, driver unit tests + doc tests, and driver integration
+                            # tests that start a real server
+cargo clippy --workspace --all-targets  # no warnings
 scripts/e2e.sh              # end-to-end: 4-5 node cluster, failures, repair, joins/leaves,
                             # indexes and the shell (~40 s)
 ```

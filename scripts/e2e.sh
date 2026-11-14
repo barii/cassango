@@ -358,5 +358,10 @@ r=$(target/release/cassa-cli -H 127.0.0.1:7999,127.0.0.1:7003 -o json -e 'db.cli
 r=$($CLI -o table -e 'db.cli.find({}).sort({_id: 1})' | head -1 | tr -s ' ')
 [[ $r == "_id n tags" ]] && ok "cli: table output" || fail "cli table header: $r"
 
+echo "rust driver"
+out=$(CASSA_HOST=127.0.0.1:7001,127.0.0.1:7003 cargo run -q -p cassa-client --example quickstart 2>&1) \
+  && [[ $out == *"in stock under £30 (3 of 3)"* && $out == *"bad query rejected"* ]] \
+  && ok "driver quickstart example runs against the cluster" || fail "driver example: $out"
+
 echo
 echo "all $pass checks passed"
