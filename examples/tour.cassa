@@ -1,0 +1,87 @@
+// A tour of cassa. Run it against a running cluster:
+//
+//   scripts/cluster.sh start 3
+//   target/release/cassa-cli -f examples/tour.cassa
+//
+// Statements may span lines; '//', '#' and '--' start comments.
+
+// ---------------------------------------------------------------- sample data
+db.users.insertMany([
+  {_id: "ann", name: "Ann Lee",  age: 31, city: "Leeds", tags: ["admin", "beta"], addr: {street: "1 Park Row", zip: "LS1"}},
+  {_id: "bob", name: "Bob Hart", age: 25, city: "York",  tags: ["beta"], visits: 3},
+  {_id: "cat", name: "Cat Moss", age: 42, city: "Leeds", addr: {zip: "LS6"}, vip: true},
+  {_id: "dan", name: "Dan Webb", age: 17, city: "Hull",  visits: 12},
+  {_id: "eve", name: "Eve Shaw", age: 58, city: "York",  tags: [], vip: false},
+])
+
+db.products.insertMany([
+  {_id: "p1", name: "Kettle",  price: 24.99, stock: 12, category: "kitchen", ratings: [5, 4, 5]},
+  {_id: "p2", name: "Toaster", price: 39.5,  stock: 0,  category: "kitchen", ratings: [3]},
+  {_id: "p3", name: "Lamp",    price: 18,    stock: 40, category: "living",  ratings: []},
+  {_id: "p4", name: "Rug",     price: 120,   stock: 3,  category: "living"},
+  {_id: "p5", name: "Mug",     price: 6.5,   stock: 200, category: "kitchen", ratings: [4, 4]},
+])
+
+// A document without an _id gets a generated UUID.
+db.notes.insert({text: "remember the milk", pinned: true})
+
+// ---------------------------------------------------------------- reading
+db.users.get("ann")
+db.users.findOne({city: "York"})
+db.users.count()
+db.users.count({city: "Leeds"})
+
+// ---------------------------------------------------------------- filters
+db.users.find({city: "Leeds"})                                    // equality
+db.users.find({"addr.zip": "LS1"})                                // nested field (quote dotted keys)
+db.users.find({tags: "beta"})                                     // matches an array element
+db.users.find({"tags.0": "admin"})                                // array element by position
+db.users.find({age: {$gte: 18, $lt: 40}})                         // range
+db.users.find({city: {$in: ["York", "Hull"]}})                    // any of
+db.users.find({city: {$nin: ["York", "Hull"]}})                   // none of
+db.users.find({age: {$ne: 31}})                                   // not equal
+db.users.find({vip: {$exists: true}})                             // field present
+db.users.find({addr: {$exists: false}})                           // field missing
+db.users.find({tags: {$size: 0}})                                 // empty array
+db.users.find({age: {$not: {$gte: 18}}})                          // negation
+db.users.find({$or: [{age: {$lt: 18}}, {vip: true}]})             // either condition
+db.users.find({$and: [{city: "York"}, {age: {$gt: 30}}]})         // both conditions
+db.users.find({$nor: [{city: "Leeds"}, {city: "York"}]})          // neither
+db.products.find({price: {$lt: 20}, stock: {$gt: 0}})             // in stock under 20
+db.products.find({ratings: {$gte: 5}})                            // any rating >= 5
+
+// ---------------------------------------------------------------- sort, skip, limit
+db.users.find({}).sort({age: -1})                                 // oldest first
+db.users.find({}).sort({city: 1, age: -1})                        // by city, then oldest
+db.products.find({category: "kitchen"}).sort({price: 1}).limit(2) // two cheapest
+db.users.find({}).sort({_id: 1}).skip(2).limit(2)                 // page 2, page size 2
+db.products.find({stock: {$gt: 0}}).count()                       // count via modifier
+
+// ---------------------------------------------------------------- updates
+db.users.update("bob", {$set: {city: "Leeds", "addr.zip": "LS2"}})   // set fields, create nested
+db.users.update("bob", {$inc: {visits: 1, age: 1}})                  // increment
+db.users.update("bob", {$push: {tags: "moved"}})                     // append to array
+db.users.update("bob", {$unset: {visits: ""}})                       // remove a field
+db.products.update("p2", {$inc: {stock: 25, price: -5.5}})           // restock and discount
+db.products.updateMany({category: "living"}, {$set: {sale: true}})   // every match
+db.users.replace("eve", {name: "Eve Shaw", age: 59, city: "Hull"})   // replace whole document
+
+// ---------------------------------------------------------------- deletes
+db.notes.deleteMany({pinned: true})
+db.users.delete("dan")
+db.users.count()
+
+// ---------------------------------------------------------------- indexes
+db.users.createIndex("city")
+db.products.createIndex("price")
+db.users.indexes()
+
+// ---------------------------------------------------------------- consistency
+db.users.find({city: "Leeds"}).consistency("all")
+consistency one
+db.users.get("ann")
+consistency quorum
+
+// ---------------------------------------------------------------- where does data live?
+db.users.owners("ann")
+show cluster

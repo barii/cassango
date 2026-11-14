@@ -2,14 +2,17 @@
 name = "cassa"
 version = "0.1.0"
 edition = "2024"
+default-run = "cassa"
 
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
+json5 = "1.3.7"
 parking_lot = "0.13.0"
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json"] }
+rustyline = "19.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 tokio = { version = "1.54.1", features = ["full"] }
