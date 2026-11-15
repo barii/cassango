@@ -1,0 +1,772 @@
+<!-- ============================================================ PART II -->
+<section class="part-title" id="part2">
+  <div class="kicker">Part II</div>
+  <h1>Developer guide</h1>
+  <p>How cassango works inside: the code layout, how a node is built, and how requests,
+  membership, storage, repair, node moves and indexes work. Read this before you change the code.</p>
+</section>
+
+<h2 id="layout">10. Repository layout</h2>
+<p>The repository is a Cargo workspace with two crates. The <code>cassango</code> crate builds two
+binaries: the server and the shell. The <code>cassango-client</code> crate is the driver library.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 270">
+  <rect class="frame" x="5" y="8" width="430" height="252" rx="10"/>
+  <text class="b" x="18" y="28">crate cassango (Cargo.toml at the root)</text>
+  <rect class="box green" x="18" y="40" width="272" height="168" rx="8"/>
+  <text class="b" x="30" y="58">bin cassango: the server</text>
+  <g class="mono">
+    <text class="mono" x="30" y="80">main.rs</text><text class="mono" x="30" y="96">api.rs</text><text class="mono" x="30" y="112">coordinator.rs</text>
+    <text class="mono" x="30" y="128">gossip.rs</text><text class="mono" x="30" y="144">ring.rs</text><text class="mono" x="30" y="160">index.rs</text>
+    <text class="mono" x="30" y="176">movement.rs</text><text class="mono" x="30" y="192">repair.rs</text>
+    <text class="mono" x="150" y="80">query.rs</text><text class="mono" x="150" y="96">model.rs</text><text class="mono" x="150" y="112">storage/mod.rs</text>
+    <text class="mono" x="150" y="128">storage/commitlog.rs</text><text class="mono" x="150" y="144">storage/sstable.rs</text>
+    <text class="mono" x="150" y="160">storage/merge.rs</text><text class="mono" x="150" y="176">storage/secondary.rs</text>
+  </g>
+  <rect class="box blue" x="300" y="40" width="122" height="168" rx="8"/>
+  <text class="b" x="312" y="58">bin cassango-cli</text>
+  <text class="mono" x="312" y="80">main.rs</text><text class="mono" x="312" y="96">parse.rs</text>
+  <text class="mono" x="312" y="112">client.rs</text><text class="mono" x="312" y="128">output.rs</text>
+  <text class="xs" x="312" y="160">src/bin/cassango-cli/</text>
+  <text class="xs" x="18" y="228">deps: tokio · axum · reqwest · serde_json · clap · tracing · parking_lot</text>
+  <text class="xs" x="18" y="244">cli only: rustyline · json5</text>
+
+  <rect class="box violet" x="448" y="8" width="225" height="130" rx="10"/>
+  <text class="b" x="460" y="28">crate cassango-client (client/)</text>
+  <text class="mono" x="460" y="50">src/lib.rs</text><text class="xs" x="560" y="50">Client, builder</text>
+  <text class="mono" x="460" y="66">src/collection.rs</text><text class="xs" x="575" y="66"></text>
+  <text class="mono" x="460" y="82">src/query.rs</text><text class="xs" x="560" y="82">Filter, Update</text>
+  <text class="mono" x="460" y="98">src/types.rs</text><text class="xs" x="560" y="98">results, info</text>
+  <text class="mono" x="460" y="114">src/error.rs</text><text class="xs" x="560" y="114">Error enum</text>
+  <text class="mono" x="460" y="130">examples/quickstart.rs</text>
+
+  <rect class="box amber" x="448" y="150" width="225" height="48" rx="8"/>
+  <text class="b" x="460" y="169">tests/driver.rs</text>
+  <text class="xs" x="460" y="186">starts a real server, drives it with the client</text>
+  <rect class="box gray" x="448" y="210" width="225" height="50" rx="8"/>
+  <text class="b" x="460" y="229">scripts/ · Dockerfile · compose</text>
+  <text class="xs" x="460" y="246">cluster.sh, e2e.sh, 6-node docker-compose.yml</text>
+  <line class="ln dash" x1="448" y1="174" x2="292" y2="174"/>
+  <line class="ln dash" x1="560" y1="150" x2="560" y2="140"/>
+</svg>
+<figcaption><b>Figure 4.</b> Workspace layout. The CLI uses its own small HTTP client, not the driver. The integration tests use both the server binary and the driver.</figcaption>
+</figure>
+
+<table>
+  <tr><th style="width:24%">Module</th><th>Responsibility</th></tr>
+  <tr><td><code>main.rs</code></td><td>Flags (clap), wiring: storage, gossiper, coordinator, index manager, repair scheduler, HTTP server, graceful shutdown</td></tr>
+  <tr><td><code>model.rs</code></td><td>Shared types: <code>Mutation</code>, <code>Record</code> (timestamp + value or tombstone), consistency levels, clocks</td></tr>
+  <tr><td><code>api.rs</code></td><td>axum routes: public <code>/collections</code>, <code>/cluster</code>, <code>/admin</code> and node-to-node <code>/internal/*</code></td></tr>
+  <tr><td><code>coordinator.rs</code></td><td>Replicated reads and writes, consistency checks, hinted handoff, read repair, two-phase <code>find</code></td></tr>
+  <tr><td><code>gossip.rs</code></td><td>Membership, heartbeats, failure detection, node status, index schema, the current and future rings</td></tr>
+  <tr><td><code>ring.rs</code></td><td>Token hashing, vnodes, replica placement, token ranges, ownership</td></tr>
+  <tr><td><code>query.rs</code></td><td>Filter validation and matching, sorting, update operators</td></tr>
+  <tr><td><code>index.rs</code></td><td>Index definitions, <code>schema.json</code>, background build and drop</td></tr>
+  <tr><td><code>movement.rs</code></td><td>Bootstrap, decommission, removenode, cleanup; range streaming</td></tr>
+  <tr><td><code>repair.rs</code></td><td>Merkle-tree anti-entropy repair and its scheduler</td></tr>
+  <tr><td><code>storage/</code></td><td>The LSM engine: commit log, memtables, SSTables, merge, compaction, secondary index entries</td></tr>
+</table>
+
+<h2 id="node">11. Inside a node</h2>
+<p>Every node runs the same code and plays every role. There's no master. A request that arrives
+at a node is handled by the <b>coordinator</b> layer, which uses gossip and the ring to find the
+replicas and talks to them, including itself, over the <code>/internal</code> API.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 365">
+  <rect class="box blue" x="10" y="10" width="660" height="50" rx="8"/>
+  <text class="b mid" x="340" y="31">HTTP API · api.rs (axum)</text>
+  <text class="xs mid" x="340" y="48">public: /collections · /cluster · /admin     internal: /internal/{apply, get, multiget, scan, gossip, stream, pull, repair/trees, repair/fetch}</text>
+
+  <rect class="box green" x="10" y="95" width="125" height="85" rx="8"/>
+  <text class="b mid" x="72" y="115">Coordinator</text><text class="xs mid" x="72" y="130">coordinator.rs</text>
+  <text class="xs mid" x="72" y="146">replication · CL</text><text class="xs mid" x="72" y="159">hints · read repair</text><text class="xs mid" x="72" y="172">two-phase find</text>
+  <rect class="box violet" x="140" y="95" width="125" height="85" rx="8"/>
+  <text class="b mid" x="202" y="115">Index manager</text><text class="xs mid" x="202" y="130">index.rs</text>
+  <text class="xs mid" x="202" y="146">definitions</text><text class="xs mid" x="202" y="159">schema.json</text><text class="xs mid" x="202" y="172">build / drop worker</text>
+  <rect class="box amber" x="270" y="95" width="125" height="85" rx="8"/>
+  <text class="b mid" x="332" y="115">Repair</text><text class="xs mid" x="332" y="130">repair.rs</text>
+  <text class="xs mid" x="332" y="146">Merkle trees</text><text class="xs mid" x="332" y="159">diff + stream</text><text class="xs mid" x="332" y="172">scheduler</text>
+  <rect class="box amber" x="400" y="95" width="125" height="85" rx="8"/>
+  <text class="b mid" x="462" y="115">Movement</text><text class="xs mid" x="462" y="130">movement.rs</text>
+  <text class="xs mid" x="462" y="146">bootstrap</text><text class="xs mid" x="462" y="159">decommission</text><text class="xs mid" x="462" y="172">removenode · cleanup</text>
+
+  <rect class="box green" x="10" y="215" width="515" height="85" rx="8"/>
+  <text class="b mid" x="267" y="235">Storage engine · storage/</text>
+  <g>
+    <rect class="box" x="22" y="246" width="88" height="42" rx="5"/><text class="xs mid" x="66" y="264">commit log</text><text class="xs mid" x="66" y="277">commitlog.rs</text>
+    <rect class="box" x="120" y="246" width="88" height="42" rx="5"/><text class="xs mid" x="164" y="264">memtables</text><text class="xs mid" x="164" y="277">mod.rs</text>
+    <rect class="box" x="218" y="246" width="88" height="42" rx="5"/><text class="xs mid" x="262" y="264">SSTables</text><text class="xs mid" x="262" y="277">sstable.rs</text>
+    <rect class="box" x="316" y="246" width="88" height="42" rx="5"/><text class="xs mid" x="360" y="264">k-way merge</text><text class="xs mid" x="360" y="277">merge.rs</text>
+    <rect class="box" x="414" y="246" width="100" height="42" rx="5"/><text class="xs mid" x="464" y="264">index entries</text><text class="xs mid" x="464" y="277">secondary.rs</text>
+  </g>
+
+  <rect class="box blue" x="540" y="95" width="130" height="85" rx="8"/>
+  <text class="b mid" x="605" y="115">Gossiper</text><text class="xs mid" x="605" y="130">gossip.rs</text>
+  <text class="xs mid" x="605" y="146">membership</text><text class="xs mid" x="605" y="159">failure detector</text><text class="xs mid" x="605" y="172">index schema</text>
+  <rect class="box blue" x="540" y="215" width="130" height="85" rx="8"/>
+  <text class="b mid" x="605" y="235">Token ring</text><text class="xs mid" x="605" y="250">ring.rs</text>
+  <text class="xs mid" x="605" y="266">current ring</text><text class="xs mid" x="605" y="279">future ring</text><text class="xs mid" x="605" y="292">replica placement</text>
+  <rect class="box gray" x="10" y="320" width="660" height="38" rx="8"/>
+  <text class="b mid" x="250" y="343">Query engine · query.rs</text>
+  <text class="xs mid" x="480" y="343">filter matching · sort · update operators (used by coordinator and storage)</text>
+
+  <line class="ln" x1="72" y1="60" x2="72" y2="93"/>
+  <line class="ln" x1="202" y1="60" x2="202" y2="93"/>
+  <line class="ln" x1="332" y1="60" x2="332" y2="93"/>
+  <line class="ln" x1="462" y1="60" x2="462" y2="93"/>
+  <line class="ln" x1="605" y1="60" x2="605" y2="93"/>
+  <line class="ln" x1="72" y1="180" x2="72" y2="213"/>
+  <line class="ln" x1="202" y1="180" x2="202" y2="213"/>
+  <line class="ln" x1="332" y1="180" x2="332" y2="213"/>
+  <line class="ln" x1="462" y1="180" x2="462" y2="213"/>
+  <line class="ln" x1="605" y1="180" x2="605" y2="213"/>
+  <line class="ln dash" x1="525" y1="137" x2="538" y2="137"/>
+</svg>
+<figcaption><b>Figure 5.</b> The layers of a node. Every component reads the cluster view from the gossiper and the ring, and stores data through the storage engine.</figcaption>
+</figure>
+
+<p>Concurrency model: the HTTP server, gossip, hint replay, repair and streaming are tokio tasks.
+The storage engine runs a dedicated <code>cassango-storage</code> thread for flushes and compactions,
+and the index manager a <code>cassango-index</code> thread for builds. Shared state uses
+<code>parking_lot</code> locks and is never held across an <code>.await</code>.</p>
+
+<h2 id="ring">12. Partitioning: the token ring</h2>
+<p>Every node owns 16 positions (<b>tokens</b>, or virtual nodes) on a 64-bit ring. The tokens come
+from hashing the node id, so they're stable across restarts. A document's position is
+<code>key_token(collection, id)</code>: 64-bit FNV-1a followed by a splitmix64 finalizer. The hash is
+written by hand because it must give the same result in every process and version, which
+std's hasher doesn't promise.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 335">
+  <circle cx="200" cy="170" r="120" fill="none" stroke="#cbd5e1" stroke-width="10"/>
+  <path d="M319.9,174.2 A120,120 0 0 1 168.9,285.9" fill="none" stroke="#f59e0b" stroke-width="10" stroke-linecap="round" opacity=".55"/>
+  <g stroke="#fff" stroke-width="2">
+    <circle cx="231.1" cy="54.1" r="9" fill="#3b82f6"/><circle cx="284.9" cy="85.1" r="9" fill="#10b981"/>
+    <circle cx="315.9" cy="138.9" r="9" fill="#f59e0b"/><circle cx="315.9" cy="201.1" r="9" fill="#3b82f6"/>
+    <circle cx="284.9" cy="254.9" r="9" fill="#3b82f6"/><circle cx="231.1" cy="285.9" r="9" fill="#10b981"/>
+    <circle cx="168.9" cy="285.9" r="9" fill="#f59e0b"/><circle cx="115.1" cy="254.9" r="9" fill="#10b981"/>
+    <circle cx="84.1" cy="201.1" r="9" fill="#3b82f6"/><circle cx="84.1" cy="138.9" r="9" fill="#f59e0b"/>
+    <circle cx="115.1" cy="85.1" r="9" fill="#f59e0b"/><circle cx="168.9" cy="54.1" r="9" fill="#10b981"/>
+  </g>
+  <path d="M319.9,166 l7,8 -7,8 -7,-8 z" fill="#dc2626"/>
+  <text class="sm b" x="333" y="170">token of users/ann</text>
+  <text class="xs" x="333" y="183">key_token("users", "ann")</text>
+  <text class="sm" x="330" y="212">① replica 1 (A)</text>
+  <text class="sm" x="298" y="270">skip: A again</text>
+  <text class="sm" x="236" y="308">② replica 2 (B)</text>
+  <text class="sm end" x="162" y="308">③ replica 3 (C)</text>
+  <text class="b mid" x="200" y="166">ring of 2<tspan baseline-shift="super" font-size="8">64</tspan> tokens</text>
+  <text class="xs mid" x="200" y="182">walk clockwise from the key</text>
+  <text class="xs mid" x="200" y="20">0 / 2<tspan baseline-shift="super" font-size="7">64</tspan></text>
+
+  <text class="b" x="452" y="40">Placing a document</text>
+  <text class="sm" x="452" y="62">1. Hash the collection and _id to a token.</text>
+  <text class="sm" x="452" y="80">2. Walk clockwise from that token.</text>
+  <text class="sm" x="452" y="98">3. Take the first RF distinct nodes.</text>
+  <text class="sm" x="452" y="112">    Tokens of a node already picked</text>
+  <text class="sm" x="452" y="126">    are skipped.</text>
+  <text class="sm" x="452" y="144">4. The first is the primary replica;</text>
+  <text class="sm" x="452" y="158">    repair -pr repairs primary ranges.</text>
+  <g>
+    <circle cx="460" cy="200" r="7" fill="#3b82f6"/><text class="sm" x="474" y="204">node A tokens</text>
+    <circle cx="460" cy="222" r="7" fill="#10b981"/><text class="sm" x="474" y="226">node B tokens</text>
+    <circle cx="460" cy="244" r="7" fill="#f59e0b"/><text class="sm" x="474" y="248">node C tokens</text>
+    <text class="xs" x="452" y="274">4 of each node's 16 vnodes are shown.</text>
+    <text class="xs" x="452" y="288">More vnodes spread ownership more evenly</text>
+    <text class="xs" x="452" y="302">and share the work of a join or leave.</text>
+  </g>
+</svg>
+<figcaption><b>Figure 6.</b> Replica placement with RF 3. The arc is the part of the walk that found the three replicas.</figcaption>
+</figure>
+
+<p>A <code>TokenRange</code> is <code>(start, end]</code> and may wrap around zero. Ranges are the unit of
+ownership for repair, streaming and cleanup. <code>ring.rs</code> can list the ranges a node is a
+replica for, its primary ranges, and the ranges whose owners change between two rings
+(<code>movement_ranges</code>).</p>
+
+<h2 id="gossip">13. Gossip and failure detection</h2>
+<p>Every second each node increments its own <b>heartbeat</b> and swaps its whole membership table
+with a peer: a POST to <code>/internal/gossip</code>, whose reply carries the peer's table. Both sides
+keep, for each node, the entry with the higher version <code>(generation, heartbeat, status_seq)</code>.
+The generation changes on every restart, so a restarted node is never mistaken for an old one.
+The same message carries the <b>index schema</b>, merged by last write wins.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 250">
+  <rect class="box blue" x="10" y="30" width="180" height="140" rx="8"/>
+  <text class="b mid" x="100" y="50">node1's view</text>
+  <text class="mono" x="20" y="74">node   gen hb   status</text>
+  <text class="mono" x="20" y="92">node1  7   812  NORMAL</text>
+  <text class="mono" x="20" y="108">node2  3   790  NORMAL</text>
+  <text class="mono" x="20" y="124" fill="#b45309">node3  5   411  NORMAL</text>
+  <text class="xs mid" x="100" y="156">+ index schema</text>
+
+  <rect class="box green" x="300" y="30" width="180" height="140" rx="8"/>
+  <text class="b mid" x="390" y="50">node2's view</text>
+  <text class="mono" x="310" y="74">node   gen hb   status</text>
+  <text class="mono" x="310" y="92" fill="#b45309">node1  7   805  NORMAL</text>
+  <text class="mono" x="310" y="108">node2  3   799  NORMAL</text>
+  <text class="mono" x="310" y="124">node3  5   430  NORMAL</text>
+  <text class="xs mid" x="390" y="156">+ index schema</text>
+
+  <line class="lb" x1="190" y1="76" x2="298" y2="76"/>
+  <text class="xs mid" x="245" y="68">1. POST my table</text>
+  <line class="lg" x1="300" y1="118" x2="192" y2="118"/>
+  <text class="xs mid" x="245" y="134">2. reply with theirs</text>
+  <text class="sm mid" x="245" y="196">3. Both keep the newer entry per node: node1 learns node3's</text>
+  <text class="sm mid" x="245" y="210">hb 430, node2 learns node1's hb 812.</text>
+  <text class="xs mid" x="245" y="234">Targets each round: one random live peer, sometimes a DOWN node, sometimes a seed.</text>
+
+  <text class="b mid" x="595" y="28">failure detector</text>
+  <circle class="green" cx="595" cy="75" r="28"/><text class="b mid" x="595" y="79">UP</text>
+  <circle class="red" cx="595" cy="185" r="28"/><text class="b mid" x="595" y="189">DOWN</text>
+  <path class="lr" d="M617,93 Q655,130 617,167"/>
+  <text class="xs" x="640" y="122">no newer</text><text class="xs" x="640" y="134">heartbeat</text><text class="xs" x="640" y="146">for 5 s</text>
+  <path class="lg" d="M573,167 Q535,130 573,93"/>
+  <text class="xs end" x="550" y="126">heartbeat</text><text class="xs end" x="550" y="138">advances</text>
+</svg>
+<figcaption><b>Figure 7.</b> One gossip exchange (left) and the timeout-based failure detector (right).</figcaption>
+</figure>
+
+<ul>
+  <li><b>UP/DOWN</b> is local: a node marks a peer DOWN when it hasn't seen a newer heartbeat for
+  <code>--failure-timeout-ms</code>. Coordinators use this to decide which replicas are alive.</li>
+  <li><b>Status</b> (JOINING, NORMAL, LEAVING, LEFT) is set by the node itself, or by removenode on behalf of a dead
+  node. Each change increments <code>status_seq</code>, so the change wins against older entries everywhere.</li>
+  <li>From the merged table, each node computes the <b>current ring</b> (NORMAL + LEAVING) and the
+  <b>future ring</b> (NORMAL + JOINING). Section 18 explains why there are two.</li>
+  <li>Nodes that become UP again trigger <b>hint replay</b> (next section). LEFT nodes are dropped from gossip targets.</li>
+</ul>
+
+<h2 id="writes">14. The write path</h2>
+<p>A write (<code>insert</code>, <code>put</code>, <code>update</code>, <code>delete</code>) becomes a
+<code>Mutation</code>: collection, key, and a <code>Record</code> with the coordinator's timestamp in
+microseconds and either a JSON value or a tombstone.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 355">
+  <g>
+    <rect class="box blue" x="20" y="8" width="100" height="30" rx="6"/><text class="b mid" x="70" y="28">Client</text>
+    <rect class="box green" x="160" y="8" width="120" height="30" rx="6"/><text class="b mid" x="220" y="28">Coordinator</text>
+    <rect class="box green" x="325" y="8" width="90" height="30" rx="6"/><text class="b mid" x="370" y="28">Replica 1</text>
+    <rect class="box green" x="445" y="8" width="90" height="30" rx="6"/><text class="b mid" x="490" y="28">Replica 2</text>
+    <rect class="box red" x="560" y="8" width="100" height="30" rx="6"/><text class="b mid" x="610" y="28">Replica 3 (down)</text>
+    <line class="life" x1="70" y1="38" x2="70" y2="345"/><line class="life" x1="220" y1="38" x2="220" y2="345"/>
+    <line class="life" x1="370" y1="38" x2="370" y2="345"/><line class="life" x1="490" y1="38" x2="490" y2="345"/>
+    <line class="life" x1="610" y1="38" x2="610" y2="345"/>
+  </g>
+  <line class="lb" x1="70" y1="66" x2="218" y2="66"/><text class="xs mid" x="145" y="60">PUT /collections/users/docs/ann</text>
+  <rect class="box gray" x="228" y="78" width="134" height="40" rx="5"/>
+  <text class="xs mid" x="295" y="94">timestamp + ring lookup</text><text class="xs mid" x="295" y="108">live replicas ≥ CL? else 503</text>
+  <line class="ln" x1="220" y1="138" x2="368" y2="138"/><text class="xs mid" x="295" y="132">/internal/apply</text>
+  <line class="ln" x1="220" y1="156" x2="488" y2="156"/><text class="xs mid" x="430" y="150">/internal/apply</text>
+  <rect class="box amber" x="228" y="166" width="134" height="24" rx="5"/><text class="xs mid" x="295" y="182">R3 is DOWN → queue a hint</text>
+  <line class="lg" x1="370" y1="208" x2="222" y2="208"/><text class="xs mid" x="295" y="202">ack</text>
+  <line class="lg" x1="490" y1="226" x2="222" y2="226"/><text class="xs mid" x="410" y="220">ack: quorum (2) reached</text>
+  <line class="lb" x1="220" y1="252" x2="72" y2="252"/><text class="xs mid" x="145" y="246">200 {"_id": "ann"}</text>
+  <line class="plain dash" x1="10" y1="276" x2="670" y2="276"/>
+  <rect x="250" y="268" width="180" height="16" fill="#fff"/><text class="xs mid" x="340" y="280">later: gossip sees Replica 3 UP</text>
+  <line class="la" x1="220" y1="306" x2="608" y2="306"/><text class="xs mid" x="415" y="300">replay hint (hint replayer, every 2 s)</text>
+  <line class="lg" x1="610" y1="330" x2="222" y2="330"/><text class="xs mid" x="415" y="324">ack → hint removed</text>
+</svg>
+<figcaption><b>Figure 8.</b> A quorum write with one replica down.</figcaption>
+</figure>
+
+<ol>
+  <li>The coordinator assigns the timestamp, then asks the ring for the replicas, plus any <b>pending</b>
+  replicas if a node is joining or leaving.</li>
+  <li>If fewer than the consistency level are alive, it fails with <code>503</code> before sending anything.</li>
+  <li>It sends to all live replicas in parallel, including itself if it's one. A replica applies the batch through
+  <code>storage.apply_batch</code>: commit log, then memtable, plus index upkeep.</li>
+  <li>It returns once enough current-ring replicas have acknowledged, or <code>504</code> after <code>rpc_timeout</code>.
+  The other requests keep running.</li>
+  <li>Down replicas, and replicas whose request failed, get a <b>hint</b> in the coordinator's memory, up to
+  100,000 per node. Every 2 seconds the hint replayer delivers hints to nodes that are UP again. Hints for LEFT nodes are dropped.</li>
+</ol>
+<p><code>update</code> runs on the coordinator: a read at the requested consistency, the operators
+applied by <code>query.rs</code>, then a normal write. It isn't atomic: concurrent updates resolve by last write wins.</p>
+
+<h2 id="reads">15. The read path and read repair</h2>
+<figure>
+<svg class="d" viewBox="0 0 680 310">
+  <g>
+    <rect class="box blue" x="20" y="8" width="100" height="30" rx="6"/><text class="b mid" x="70" y="28">Client</text>
+    <rect class="box green" x="160" y="8" width="120" height="30" rx="6"/><text class="b mid" x="220" y="28">Coordinator</text>
+    <rect class="box green" x="325" y="8" width="90" height="30" rx="6"/><text class="b mid" x="370" y="28">Replica 1</text>
+    <rect class="box amber" x="445" y="8" width="90" height="30" rx="6"/><text class="b mid" x="490" y="28">Replica 2</text>
+    <rect class="box green" x="565" y="8" width="90" height="30" rx="6"/><text class="b mid" x="610" y="28">Replica 3</text>
+    <line class="life" x1="70" y1="38" x2="70" y2="300"/><line class="life" x1="220" y1="38" x2="220" y2="300"/>
+    <line class="life" x1="370" y1="38" x2="370" y2="300"/><line class="life" x1="490" y1="38" x2="490" y2="300"/>
+    <line class="life" x1="610" y1="38" x2="610" y2="300"/>
+  </g>
+  <line class="lb" x1="70" y1="64" x2="218" y2="64"/><text class="xs mid" x="145" y="58">GET …/docs/ann (quorum)</text>
+  <line class="ln" x1="220" y1="90" x2="368" y2="90"/><text class="xs mid" x="295" y="84">/internal/get</text>
+  <line class="ln" x1="220" y1="106" x2="488" y2="106"/>
+  <line class="ln" x1="220" y1="122" x2="608" y2="122"/>
+  <line class="lg" x1="370" y1="150" x2="222" y2="150"/><text class="xs mid" x="295" y="144">v2 · ts 20</text>
+  <line class="la" x1="490" y1="168" x2="222" y2="168"/><text class="xs mid" x="410" y="162">v1 · ts 10 (stale)</text>
+  <rect class="box gray" x="228" y="178" width="134" height="36" rx="5"/>
+  <text class="xs mid" x="295" y="193">2 answers = quorum</text><text class="xs mid" x="295" y="206">newest timestamp wins → v2</text>
+  <line class="lb" x1="220" y1="234" x2="72" y2="234"/><text class="xs mid" x="145" y="228">200 v2</text>
+  <line class="la dash" x1="220" y1="262" x2="488" y2="262"/><text class="xs mid" x="355" y="256">read repair: apply v2 (in the background)</text>
+  <line class="plain dash" x1="610" y1="288" x2="222" y2="288"/><text class="xs mid" x="415" y="282">v2 arrives late: not needed for quorum</text>
+</svg>
+<figcaption><b>Figure 9.</b> A quorum read. A stale replica gets the newest version back in the background.</figcaption>
+</figure>
+<p>The coordinator asks every live replica, waits for as many answers as the consistency level
+needs, and returns the version with the newest timestamp. A tombstone means "not found". Replicas
+that answered with an older version, or with nothing, are sent the winner in the background. That's
+<b>read repair</b>: it fixes data that gets read. Section 17 covers repair of everything else.</p>
+
+<h2 id="find">16. Queries: two-phase find</h2>
+<p>Documents are spread by <code>_id</code>, so a filter on any other field has to ask every node.
+<code>find</code> runs in two phases so that a stale replica can't return a document that has since
+been changed or deleted.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 300">
+  <rect class="box blue" x="10" y="120" width="110" height="60" rx="8"/>
+  <text class="b mid" x="65" y="145">Coordinator</text><text class="xs mid" x="65" y="161">POST /find</text>
+  <text class="sm b" x="190" y="24">phase 1 · /internal/scan {filter}</text>
+  <rect class="box green" x="190" y="40" width="125" height="40" rx="6"/><text class="sm mid" x="252" y="58">node1</text><text class="xs mid" x="252" y="71">index age · ids</text>
+  <rect class="box green" x="190" y="100" width="125" height="40" rx="6"/><text class="sm mid" x="252" y="118">node2</text><text class="xs mid" x="252" y="131">full scan · ids</text>
+  <rect class="box green" x="190" y="160" width="125" height="40" rx="6"/><text class="sm mid" x="252" y="178">node3</text><text class="xs mid" x="252" y="191">index age · ids</text>
+  <rect class="box red" x="190" y="220" width="125" height="40" rx="6"/><text class="sm mid" x="252" y="238">node4 · DOWN</text><text class="xs mid" x="252" y="251">→ partial: true</text>
+  <line class="ln" x1="120" y1="145" x2="188" y2="60"/><line class="ln" x1="120" y1="148" x2="188" y2="120"/>
+  <line class="ln" x1="120" y1="152" x2="188" y2="180"/><line class="ln dash" x1="120" y1="155" x2="188" y2="240"/>
+  <rect class="box amber" x="350" y="120" width="100" height="60" rx="8"/>
+  <text class="b mid" x="400" y="145">union</text><text class="xs mid" x="400" y="161">candidate ids</text>
+  <line class="ln" x1="315" y1="60" x2="348" y2="135"/><line class="ln" x1="315" y1="120" x2="348" y2="145"/><line class="ln" x1="315" y1="180" x2="348" y2="160"/>
+  <text class="sm b" x="480" y="24">phase 2</text>
+  <rect class="box violet" x="480" y="40" width="190" height="40" rx="6"/><text class="sm mid" x="575" y="57">/internal/multiget</text><text class="xs mid" x="575" y="71">every replica's version of each id</text>
+  <rect class="box violet" x="480" y="100" width="190" height="40" rx="6"/><text class="sm mid" x="575" y="117">last write wins per id</text><text class="xs mid" x="575" y="131">tombstones drop out</text>
+  <rect class="box violet" x="480" y="160" width="190" height="40" rx="6"/><text class="sm mid" x="575" y="177">re-check the filter</text><text class="xs mid" x="575" y="191">on the winning version</text>
+  <rect class="box blue" x="480" y="220" width="190" height="40" rx="6"/><text class="sm mid" x="575" y="237">sort · skip · limit</text><text class="xs mid" x="575" y="251">→ {docs, matched, partial}</text>
+  <line class="ln" x1="450" y1="140" x2="478" y2="70"/>
+  <line class="ln" x1="575" y1="80" x2="575" y2="98"/><line class="ln" x1="575" y1="140" x2="575" y2="158"/><line class="ln" x1="575" y1="200" x2="575" y2="218"/>
+  <text class="xs" x="10" y="288">Each node in phase 1 answers from its own replicas, using an index if one fits. Phase 2 makes the answer independent of any one replica.</text>
+</svg>
+<figcaption><b>Figure 10.</b> Scatter/gather <code>find</code>.</figcaption>
+</figure>
+<ul>
+  <li><code>matched</code> counts all matches. <code>docs</code> is the page after <code>sort</code>, <code>skip</code> and <code>limit</code>, which run on the coordinator.</li>
+  <li><code>partial: true</code> means some node didn't answer phase 1. LEFT nodes don't count.</li>
+  <li>With <code>explain</code>, each node reports its plan (<code>index</code> or full scan), how many entries it examined, and how many matched.</li>
+  <li><code>count</code> is a <code>find</code> that returns only <code>matched</code>.</li>
+</ul>
+
+<h2 id="storage">17. The storage engine</h2>
+<p>Each node stores its data in a <b>log-structured merge tree</b> (LSM), like Cassandra's. Writes are
+appends and never read old data, except for index upkeep on indexed collections. Reads merge
+everything and pick the newest timestamp.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 300">
+  <rect class="box blue" x="10" y="30" width="105" height="50" rx="8"/><text class="b mid" x="62" y="52">write batch</text><text class="xs mid" x="62" y="68">apply_batch</text>
+  <rect class="box amber" x="150" y="30" width="125" height="50" rx="8"/><text class="b mid" x="212" y="52">commit log</text><text class="xs mid" x="212" y="68">len | crc32 | json</text>
+  <rect class="box green" x="310" y="30" width="125" height="50" rx="8"/><text class="b mid" x="372" y="52">memtable</text><text class="xs mid" x="372" y="68">sorted, in memory</text>
+  <rect class="box gray" x="470" y="30" width="125" height="50" rx="8"/><text class="b mid" x="532" y="52">frozen memtable</text><text class="xs mid" x="532" y="68">&gt; --memtable-mb</text>
+  <line class="ln" x1="115" y1="55" x2="148" y2="55"/><line class="ln" x1="275" y1="55" x2="308" y2="55"/><line class="ln" x1="435" y1="55" x2="468" y2="55"/>
+  <text class="xs mid" x="132" y="24">1</text><text class="xs mid" x="292" y="24">2</text><text class="xs mid" x="452" y="24">swap</text>
+
+  <rect class="frame" x="290" y="120" width="380" height="170" rx="10"/>
+  <text class="sm b" x="302" y="140">SSTables on disk: immutable, sorted, sst-&lt;gen&gt;.db</text>
+  <rect class="box green" x="305" y="155" width="62" height="30" rx="4"/><text class="xs mid" x="336" y="174">sst-21</text>
+  <rect class="box green" x="375" y="155" width="62" height="30" rx="4"/><text class="xs mid" x="406" y="174">sst-22</text>
+  <rect class="box green" x="445" y="155" width="62" height="30" rx="4"/><text class="xs mid" x="476" y="174">sst-23</text>
+  <rect class="box green" x="515" y="155" width="62" height="30" rx="4"/><text class="xs mid" x="546" y="174">sst-24</text>
+  <rect class="box green" x="590" y="150" width="70" height="40" rx="4"/><text class="xs mid" x="625" y="174">sst-12</text>
+  <line class="la" x1="440" y1="190" x2="440" y2="228"/>
+  <text class="xs" x="448" y="208">size-tiered compaction: ≥ 4 similar-sized tables</text>
+  <text class="xs" x="448" y="220">merged, newest version per key kept</text>
+  <rect class="box green" x="330" y="230" width="220" height="34" rx="4"/><text class="xs mid" x="440" y="251">sst-25 (merged)</text>
+  <text class="xs" x="302" y="282">old tombstones purged only when nothing older can exist elsewhere</text>
+  <path class="ln" d="M532,80 L532,118"/>
+  <text class="xs" x="538" y="104">flush (background thread)</text>
+  <path class="ln dash" d="M470,72 Q360,105 240,82"/>
+  <text class="xs" x="300" y="108">segments deleted after flush</text>
+
+  <rect class="box gray" x="10" y="120" width="260" height="170" rx="10"/>
+  <text class="b" x="22" y="142">read path: get(key)</text>
+  <text class="sm" x="22" y="164">1. active memtable</text>
+  <text class="sm" x="22" y="182">2. frozen memtables being flushed</text>
+  <text class="sm" x="22" y="200">3. SSTables, newest first</text>
+  <text class="xs" x="36" y="216">· skip if the bloom filter says no</text>
+  <text class="xs" x="36" y="230">· skip if its max_ts is older than</text>
+  <text class="xs" x="36" y="243">  the best version found so far</text>
+  <text class="sm" x="22" y="264">→ newest timestamp wins;</text>
+  <text class="sm" x="22" y="280">   a tombstone means "not found"</text>
+</svg>
+<figcaption><b>Figure 11.</b> Writes go to the commit log and the memtable. Memtables are flushed to SSTables, which compaction merges.</figcaption>
+</figure>
+
+<h3>Durability</h3>
+<ul>
+  <li><b>Commit log.</b> Segmented. Each record is framed as <code>len | crc32 | json</code>. On startup the log is
+  replayed. A torn or corrupt tail after a crash is detected by length and CRC and skipped. A segment is deleted
+  once every mutation in it is in an SSTable. <code>--fsync</code> fsyncs after every batch. Without it, a crash can
+  lose the last writes the OS hadn't written, which replicas and hints cover.</li>
+  <li><b>Atomic SSTables.</b> Each SSTable is written to a <code>.tmp</code> file, fsynced, then renamed into place, so a crash
+  never leaves half a table.</li>
+  <li><b>Graceful shutdown.</b> SIGINT flushes the memtable and stops cleanly.</li>
+</ul>
+
+<h3>SSTable format</h3>
+<figure>
+<svg class="d" viewBox="0 0 680 185">
+  <rect class="green" x="10" y="25" width="90" height="38" stroke-width="1"/><text class="xs mid" x="55" y="48">data block 0</text>
+  <rect class="gray" x="100" y="25" width="26" height="38" stroke-width="1"/><text class="xs mid" x="113" y="48">crc</text>
+  <rect class="green" x="126" y="25" width="90" height="38" stroke-width="1"/><text class="xs mid" x="171" y="48">data block 1</text>
+  <rect class="gray" x="216" y="25" width="26" height="38" stroke-width="1"/><text class="xs mid" x="229" y="48">crc</text>
+  <rect class="box" x="242" y="25" width="36" height="38" stroke-width="1"/><text class="xs mid" x="260" y="48">…</text>
+  <rect class="blue" x="278" y="25" width="104" height="38" stroke-width="1"/><text class="xs mid" x="330" y="42">sparse index</text><text class="xs mid" x="330" y="55">first key · off · len</text>
+  <rect class="gray" x="382" y="25" width="26" height="38" stroke-width="1"/><text class="xs mid" x="395" y="48">crc</text>
+  <rect class="violet" x="408" y="25" width="104" height="38" stroke-width="1"/><text class="xs mid" x="460" y="42">bloom filter</text><text class="xs mid" x="460" y="55">10 bits per key</text>
+  <rect class="gray" x="512" y="25" width="26" height="38" stroke-width="1"/><text class="xs mid" x="525" y="48">crc</text>
+  <rect class="amber" x="538" y="25" width="132" height="38" stroke-width="1"/><text class="xs mid" x="604" y="48">footer (52 bytes)</text>
+  <text class="xs" x="10" y="16">~4 KiB blocks, read on demand with positional reads</text>
+  <text class="xs" x="278" y="16">loaded into memory when the file is opened</text>
+  <line class="plain dash" x1="10" y1="63" x2="10" y2="110"/><line class="plain dash" x1="100" y1="63" x2="470" y2="110"/>
+  <rect class="box" x="10" y="110" width="80" height="30" stroke-width="1"/><text class="mono mid" x="50" y="129">key_len u32</text>
+  <rect class="box" x="90" y="110" width="100" height="30" stroke-width="1"/><text class="mono mid" x="140" y="129">key</text>
+  <rect class="box" x="190" y="110" width="70" height="30" stroke-width="1"/><text class="mono mid" x="225" y="129">ts u64</text>
+  <rect class="box" x="260" y="110" width="90" height="30" stroke-width="1"/><text class="mono mid" x="305" y="129">val_len u32</text>
+  <rect class="box" x="350" y="110" width="120" height="30" stroke-width="1"/><text class="mono mid" x="410" y="129">JSON value</text>
+  <text class="xs" x="10" y="160">One entry, sorted by key. val_len = u32::MAX marks a tombstone. Integers are little-endian.</text>
+  <line class="plain dash" x1="538" y1="63" x2="538" y2="80"/>
+  <text class="mono" x="500" y="94">index_off · index_len</text><text class="mono" x="500" y="108">bloom_off · bloom_len</text>
+  <text class="mono" x="500" y="122">entries · max_ts</text><text class="mono" x="500" y="136">version · magic</text>
+</svg>
+<figcaption><b>Figure 12.</b> SSTable file layout. Every section carries a CRC32.</figcaption>
+</figure>
+
+<h3>Keys, merging and compaction</h3>
+<ul>
+  <li><b>Key space.</b> Data keys are <code>&lt;collection&gt;\0&lt;id&gt;</code>. Secondary index entries live in the same tree under a
+  <code>\x01</code> prefix, which sorts before all data (section 19).</li>
+  <li><b>Scans</b> stream a k-way merge (<code>merge.rs</code>) over the memtables and every SSTable, keeping the newest
+  version of each key. A node's data doesn't have to fit in memory: only memtables, sparse indexes and bloom filters stay there.</li>
+  <li><b>Size-tiered compaction</b> groups SSTables of similar size. Once a group reaches <code>--compaction-threshold</code>, it's
+  merged into one table. <code>compact major</code> merges everything.</li>
+  <li><b>Tombstone purge.</b> A tombstone older than <code>--gc-grace-secs</code> is dropped during compaction, but only if no SSTable
+  outside the compaction and no memtable could still hold an older value for that key. Otherwise the deleted document would come back.</li>
+  <li><b>Cleanup compaction</b> rewrites SSTables through a <code>KeyFilter</code> that drops keys outside the node's ranges.</li>
+</ul>
+
+<h2 id="repair">18. Anti-entropy repair</h2>
+<p>Hinted handoff and read repair fix most differences between replicas, but not all. Hints are lost
+when a coordinator restarts, read repair only touches data that gets read, and a node can lose its disk.
+<b>Repair</b> compares replicas with Merkle trees and copies only what differs. A run covers the node's
+<b>primary</b> ranges, like <code>nodetool repair -pr</code>, so running it on every node covers the whole ring once.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 320">
+  <text class="b mid" x="170" y="20">this node</text>
+  <text class="b mid" x="510" y="20">replica node2</text>
+  <g>
+    <line class="plain" x1="170" y1="50" x2="95" y2="100"/><line class="plain" x1="170" y1="50" x2="245" y2="100"/>
+    <line class="plain" x1="95" y1="100" x2="57.5" y2="150"/><line class="plain" x1="95" y1="100" x2="132.5" y2="150"/>
+    <line class="plain" x1="245" y1="100" x2="207.5" y2="150"/><line class="plain" x1="245" y1="100" x2="282.5" y2="150"/>
+    <line class="plain" x1="57.5" y1="150" x2="38.75" y2="190"/><line class="plain" x1="57.5" y1="150" x2="76.25" y2="190"/>
+    <line class="plain" x1="132.5" y1="150" x2="113.75" y2="190"/><line class="plain" x1="132.5" y1="150" x2="151.25" y2="190"/>
+    <line class="plain" x1="207.5" y1="150" x2="188.75" y2="190"/><line x1="207.5" y1="150" x2="226.25" y2="190" stroke="#ef4444" stroke-width="2"/>
+    <line class="plain" x1="282.5" y1="150" x2="263.75" y2="190"/><line class="plain" x1="282.5" y1="150" x2="301.25" y2="190"/>
+    <line x1="170" y1="50" x2="245" y2="100" stroke="#ef4444" stroke-width="2"/><line x1="245" y1="100" x2="207.5" y2="150" stroke="#ef4444" stroke-width="2"/>
+    <circle class="red" cx="170" cy="50" r="11"/><circle class="gray" cx="95" cy="100" r="11"/><circle class="red" cx="245" cy="100" r="11"/>
+    <circle class="gray" cx="57.5" cy="150" r="11"/><circle class="gray" cx="132.5" cy="150" r="11"/><circle class="red" cx="207.5" cy="150" r="11"/><circle class="gray" cx="282.5" cy="150" r="11"/>
+    <rect class="green" x="25" y="190" width="28" height="22" rx="3"/><rect class="green" x="62" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="100" y="190" width="28" height="22" rx="3"/><rect class="green" x="137" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="175" y="190" width="28" height="22" rx="3"/><rect class="red" x="212" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="250" y="190" width="28" height="22" rx="3"/><rect class="green" x="287" y="190" width="28" height="22" rx="3"/>
+  </g>
+  <g transform="translate(340,0)">
+    <line class="plain" x1="170" y1="50" x2="95" y2="100"/><line class="plain" x1="170" y1="50" x2="245" y2="100"/>
+    <line class="plain" x1="95" y1="100" x2="57.5" y2="150"/><line class="plain" x1="95" y1="100" x2="132.5" y2="150"/>
+    <line class="plain" x1="245" y1="100" x2="207.5" y2="150"/><line class="plain" x1="245" y1="100" x2="282.5" y2="150"/>
+    <line class="plain" x1="57.5" y1="150" x2="38.75" y2="190"/><line class="plain" x1="57.5" y1="150" x2="76.25" y2="190"/>
+    <line class="plain" x1="132.5" y1="150" x2="113.75" y2="190"/><line class="plain" x1="132.5" y1="150" x2="151.25" y2="190"/>
+    <line class="plain" x1="207.5" y1="150" x2="188.75" y2="190"/><line x1="207.5" y1="150" x2="226.25" y2="190" stroke="#ef4444" stroke-width="2"/>
+    <line class="plain" x1="282.5" y1="150" x2="263.75" y2="190"/><line class="plain" x1="282.5" y1="150" x2="301.25" y2="190"/>
+    <line x1="170" y1="50" x2="245" y2="100" stroke="#ef4444" stroke-width="2"/><line x1="245" y1="100" x2="207.5" y2="150" stroke="#ef4444" stroke-width="2"/>
+    <circle class="red" cx="170" cy="50" r="11"/><circle class="gray" cx="95" cy="100" r="11"/><circle class="red" cx="245" cy="100" r="11"/>
+    <circle class="gray" cx="57.5" cy="150" r="11"/><circle class="gray" cx="132.5" cy="150" r="11"/><circle class="red" cx="207.5" cy="150" r="11"/><circle class="gray" cx="282.5" cy="150" r="11"/>
+    <rect class="green" x="25" y="190" width="28" height="22" rx="3"/><rect class="green" x="62" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="100" y="190" width="28" height="22" rx="3"/><rect class="green" x="137" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="175" y="190" width="28" height="22" rx="3"/><rect class="red" x="212" y="190" width="28" height="22" rx="3"/>
+    <rect class="green" x="250" y="190" width="28" height="22" rx="3"/><rect class="green" x="287" y="190" width="28" height="22" rx="3"/>
+  </g>
+  <path class="ln2 dash" d="M226,214 V228 H566 V214"/>
+  <text class="xs mid" x="396" y="242">stream the entries of leaf 6 only</text>
+  <text class="xs mid" x="340" y="262">Leaf hash = XOR of hash(key, timestamp, value) for the entries in its token slice. The real trees have 2<tspan baseline-shift="super" font-size="7">10</tspan> = 1024 leaves per range.</text>
+  <rect class="box blue" x="10" y="276" width="215" height="36" rx="6"/><text class="sm mid" x="117" y="298">1 · build trees in one scan</text>
+  <rect class="box blue" x="232" y="276" width="215" height="36" rx="6"/><text class="sm mid" x="340" y="298">2 · compare from the root down</text>
+  <rect class="box blue" x="455" y="276" width="215" height="36" rx="6"/><text class="sm mid" x="562" y="298">3 · stream newest versions</text>
+</svg>
+<figcaption><b>Figure 13.</b> Comparing two replicas' trees. Matching subtrees are skipped, so only the red path is followed.</figcaption>
+</figure>
+
+<ol>
+  <li><b>Validation.</b> For each primary range, the node asks every replica (<code>/internal/repair/trees</code>) to build a Merkle tree in
+  one scan of its local data. Each range splits into 2<sup>depth</sup> leaves by token (depth 10 by default, 16 at most). XOR makes a
+  leaf hash independent of entry order. Inner nodes hash their children.</li>
+  <li><b>Comparison.</b> Trees are compared from the root down, so only differing leaves come out.</li>
+  <li><b>Streaming.</b> All replicas' entries in those leaves, tombstones included, are fetched (<code>/internal/repair/fetch</code>). The
+  newest version of each key wins, and each replica is sent only what it lacks, in batches of 500.</li>
+</ol>
+<p>Ranges with a replica down are skipped and listed in the report's <code>errors</code>. Only one repair runs per node at a time:
+a second request gets <code>409</code>. <code>--repair-interval-secs</code> schedules repair. Repair must cover every node more often than
+<code>--gc-grace-secs</code>. Otherwise a replica that missed a delete keeps the old document, and after the tombstone is purged elsewhere,
+repair copies that document back to the other replicas.</p>
+
+<h2 id="movement">19. Adding and removing nodes</h2>
+<p>A node moves through four states, carried in gossip:</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 175">
+  <rect class="box blue" x="10" y="60" width="110" height="44" rx="10"/><text class="b mid" x="65" y="86">JOINING</text>
+  <rect class="box green" x="190" y="60" width="110" height="44" rx="10"/><text class="b mid" x="245" y="86">NORMAL</text>
+  <rect class="box amber" x="370" y="60" width="110" height="44" rx="10"/><text class="b mid" x="425" y="86">LEAVING</text>
+  <rect class="box gray" x="560" y="60" width="110" height="44" rx="10"/><text class="b mid" x="615" y="86">LEFT</text>
+  <line class="ln" x1="120" y1="82" x2="188" y2="82"/><text class="xs mid" x="155" y="62">ranges</text><text class="xs mid" x="155" y="74">pulled</text>
+  <line class="ln" x1="300" y1="82" x2="368" y2="82"/><text class="xs mid" x="335" y="62">decommission</text><text class="xs mid" x="335" y="74">/ removenode</text>
+  <line class="ln" x1="480" y1="82" x2="558" y2="82"/><text class="xs mid" x="519" y="62">new owners</text><text class="xs mid" x="519" y="74">pulled</text>
+  <path class="la dash" d="M425,104 Q335,150 245,104"/><text class="xs mid" x="335" y="146">a pull failed</text>
+  <text class="xs mid" x="65" y="124">new node,</text><text class="xs mid" x="65" y="136">empty data dir</text>
+  <text class="xs mid" x="245" y="30">--no-bootstrap</text><text class="xs mid" x="245" y="42">starts here</text>
+  <text class="xs mid" x="615" y="124">safe to shut down</text>
+</svg>
+<figcaption><b>Figure 14.</b> Node lifecycle.</figcaption>
+</figure>
+
+<p>While data is moving, two rings exist. Reads and acknowledgements use the <b>current</b> ring. Writes
+also go to the replicas the <b>future</b> ring adds, so the new owner doesn't miss writes made while it copies.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 230">
+  <text class="b mid" x="110" y="22">current ring</text><text class="xs mid" x="110" y="36">NORMAL + LEAVING · serves reads, counts acks</text>
+  <circle cx="110" cy="115" r="65" fill="none" stroke="#cbd5e1" stroke-width="6"/>
+  <circle cx="110" cy="50" r="13" fill="#3b82f6" stroke="#fff" stroke-width="2"/><text class="b mid white" x="110" y="54" style="fill:#fff">A</text>
+  <circle cx="166.3" cy="147.5" r="13" fill="#10b981" stroke="#fff" stroke-width="2"/><text class="b mid" x="166.3" y="151.5" style="fill:#fff">B</text>
+  <circle cx="53.7" cy="147.5" r="13" fill="#f59e0b" stroke="#fff" stroke-width="2"/><text class="b mid" x="53.7" y="151.5" style="fill:#fff">C</text>
+  <path d="M151.8,58 l6,7 -6,7 -6,-7 z" fill="#dc2626"/><text class="xs" x="160" y="58">k</text>
+  <text class="sm mid" x="110" y="205">replicas of k: B, C, A</text>
+
+  <text class="b mid" x="330" y="22">future ring</text><text class="xs mid" x="330" y="36">NORMAL + JOINING · D is joining</text>
+  <circle cx="330" cy="115" r="65" fill="none" stroke="#cbd5e1" stroke-width="6"/>
+  <circle cx="330" cy="50" r="13" fill="#3b82f6" stroke="#fff" stroke-width="2"/><text class="b mid" x="330" y="54" style="fill:#fff">A</text>
+  <circle cx="386.3" cy="147.5" r="13" fill="#10b981" stroke="#fff" stroke-width="2"/><text class="b mid" x="386.3" y="151.5" style="fill:#fff">B</text>
+  <circle cx="273.7" cy="147.5" r="13" fill="#f59e0b" stroke="#fff" stroke-width="2"/><text class="b mid" x="273.7" y="151.5" style="fill:#fff">C</text>
+  <circle cx="391.1" cy="92.8" r="13" fill="#7c3aed" stroke="#fff" stroke-width="2"/><text class="b mid" x="391.1" y="96.8" style="fill:#fff">D</text>
+  <path d="M371.8,58 l6,7 -6,7 -6,-7 z" fill="#dc2626"/><text class="xs" x="380" y="58">k</text>
+  <text class="sm mid" x="330" y="205">replicas of k: D, B, C</text>
+
+  <rect class="box violet" x="455" y="45" width="215" height="150" rx="8"/>
+  <text class="b" x="467" y="66">pending replica = D</text>
+  <text class="sm" x="467" y="86">in the future ring, not the current one</text>
+  <text class="sm" x="467" y="108">· receives every write for k</text>
+  <text class="sm" x="467" y="126">· doesn't count toward the CL</text>
+  <text class="sm" x="467" y="144">· pulls k's range from B, C and A</text>
+  <text class="sm" x="467" y="166">When D turns NORMAL, A no longer</text>
+  <text class="sm" x="467" y="182">owns k: <tspan class="b">cleanup</tspan> on A frees the space.</text>
+</svg>
+<figcaption><b>Figure 15.</b> Current ring, future ring and the pending replica while node D joins.</figcaption>
+</figure>
+
+<p>Every move is built from one step, <b>pull</b>: a node copies token ranges from all the live replicas that
+currently hold them, in pages over <code>/internal/stream</code>, and keeps the newest version of each key. Pulling
+from every replica, not just one, means one stale replica can't leave the new owner with old data.</p>
+<table>
+  <tr><th style="width:18%">Operation</th><th>What happens</th></tr>
+  <tr><td><b>Join</b></td><td>A node with an empty data directory starts as JOINING. If it finds an existing cluster, it waits
+  <code>--ring-delay-ms</code> so every node starts sending it writes, pulls the ranges it will own, then turns NORMAL.
+  A <code>bootstrapped</code> marker file stops it from doing this twice.</td></tr>
+  <tr><td><b>Decommission</b></td><td><code>POST /admin/decommission</code> on the leaving node. It turns LEAVING, each new owner pulls the
+  ranges it gains (<code>/internal/pull</code>), then the node turns LEFT. If a pull fails, it goes back to NORMAL.</td></tr>
+  <tr><td><b>Removenode</b></td><td>For a node that is DOWN for good. The dead node is marked LEAVING on its behalf, so writes go to the
+  new owners. They pull from the surviving replicas, then the dead node is marked LEFT.</td></tr>
+  <tr><td><b>Cleanup</b></td><td>After a join, the old owners still hold data they gave away. Cleanup rewrites their SSTables without it,
+  including index entries for those documents. It refuses (<code>409</code>) while any node is joining or leaving.</td></tr>
+</table>
+<p>Only one range movement can run at a time in the cluster: decommission and removenode refuse with <code>409</code> while another
+node is joining or leaving.</p>
+
+<h2 id="indexes">20. Secondary indexes</h2>
+<p>Indexes are <b>local</b>, as in Cassandra: each node indexes only the documents it stores. <code>find</code> still asks
+every node, but each node reads index entries instead of scanning the collection.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 205">
+  <text class="sm b" x="10" y="16">index key</text>
+  <rect class="violet" x="10" y="24" width="40" height="32" stroke-width="1"/><text class="mono mid" x="30" y="44">\x01</text>
+  <rect class="gray" x="50" y="24" width="28" height="32" stroke-width="1"/><text class="mono mid" x="64" y="44">\0</text>
+  <rect class="blue" x="78" y="24" width="80" height="32" stroke-width="1"/><text class="mono mid" x="118" y="44">people</text>
+  <rect class="gray" x="158" y="24" width="28" height="32" stroke-width="1"/><text class="mono mid" x="172" y="44">\0</text>
+  <rect class="blue" x="186" y="24" width="60" height="32" stroke-width="1"/><text class="mono mid" x="216" y="44">age</text>
+  <rect class="gray" x="246" y="24" width="28" height="32" stroke-width="1"/><text class="mono mid" x="260" y="44">\0</text>
+  <rect class="amber" x="274" y="24" width="170" height="32" stroke-width="1"/><text class="mono mid" x="359" y="44">n 4055800000000000</text>
+  <rect class="gray" x="444" y="24" width="28" height="32" stroke-width="1"/><text class="mono mid" x="458" y="44">\0</text>
+  <rect class="green" x="472" y="24" width="60" height="32" stroke-width="1"/><text class="mono mid" x="502" y="44">u42</text>
+  <text class="xs mid" x="30" y="70">prefix</text><text class="xs mid" x="118" y="70">collection</text><text class="xs mid" x="216" y="70">field</text>
+  <text class="xs mid" x="359" y="70">type tag + encoded value (age 86)</text><text class="xs mid" x="502" y="70">_id</text>
+  <text class="xs" x="545" y="36">entry value: true or a</text><text class="xs" x="545" y="48">tombstone, versioned</text><text class="xs" x="545" y="60">like the document</text>
+
+  <text class="sm b" x="10" y="100">sorted index entries for people.age</text>
+  <rect x="10" y="140" width="330" height="54" fill="#fef3c7"/>
+  <text class="mono" x="20" y="120">…people\0age\0 n·17 \0 dan</text>
+  <text class="mono" x="20" y="136">…people\0age\0 n·42 \0 cat</text>
+  <text class="mono" x="20" y="154">…people\0age\0 n·86 \0 u17</text>
+  <text class="mono" x="20" y="170">…people\0age\0 n·90 \0 u42</text>
+  <text class="mono" x="20" y="186">…people\0age\0 n·90 \0 u108</text>
+  <text class="xs" x="250" y="154">◀ seek: age &gt; 85</text>
+  <text class="xs" x="250" y="186">◀ end of prefix</text>
+  <text class="b" x="380" y="100">byte order = value order</text>
+  <text class="sm" x="380" y="120">number → n + 16 hex digits of an</text>
+  <text class="sm" x="380" y="134">             order-preserving f64 transform</text>
+  <text class="sm" x="380" y="152">string → s + text, \0 and \x01 escaped</text>
+  <text class="sm" x="380" y="170">bool → b0 / b1</text>
+  <text class="sm" x="380" y="188">array → one entry per element</text>
+</svg>
+<figcaption><b>Figure 16.</b> Index entries live in the same LSM tree as documents, so a range predicate becomes a key-range scan.</figcaption>
+</figure>
+
+<figure>
+<svg class="d" viewBox="0 0 680 175">
+  <rect class="box blue" x="10" y="20" width="110" height="44" rx="8"/><text class="b mid" x="65" y="40">filter</text><text class="xs mid" x="65" y="54">from find</text>
+  <rect class="box gray" x="140" y="20" width="160" height="44" rx="8"/><text class="sm mid" x="220" y="38">usable conditions</text><text class="xs mid" x="220" y="53">top level or inside $and, index ready</text>
+  <rect class="box amber" x="320" y="20" width="80" height="44" rx="22"/><text class="sm mid" x="360" y="46">equality?</text>
+  <rect class="box amber" x="420" y="20" width="80" height="44" rx="22"/><text class="sm mid" x="460" y="46">$in?</text>
+  <rect class="box amber" x="520" y="20" width="80" height="44" rx="22"/><text class="sm mid" x="560" y="46">range?</text>
+  <rect class="box red" x="620" y="20" width="50" height="44" rx="8"/><text class="sm mid" x="645" y="46">scan</text>
+  <line class="ln" x1="120" y1="42" x2="138" y2="42"/><line class="ln" x1="300" y1="42" x2="318" y2="42"/>
+  <line class="ln" x1="400" y1="42" x2="418" y2="42"/><line class="ln" x1="500" y1="42" x2="518" y2="42"/><line class="ln" x1="600" y1="42" x2="618" y2="42"/>
+  <text class="xs mid" x="409" y="36">no</text><text class="xs mid" x="509" y="36">no</text><text class="xs mid" x="609" y="36">no</text>
+  <line class="lg" x1="360" y1="64" x2="360" y2="98"/><line class="lg" x1="460" y1="64" x2="460" y2="98"/><line class="lg" x1="560" y1="64" x2="560" y2="98"/>
+  <text class="xs" x="364" y="84">yes</text><text class="xs" x="464" y="84">yes</text><text class="xs" x="564" y="84">yes</text>
+  <rect class="box green" x="313" y="100" width="94" height="38" rx="6"/><text class="xs mid" x="360" y="116">one point</text><text class="xs mid" x="360" y="129">range</text>
+  <rect class="box green" x="413" y="100" width="94" height="38" rx="6"/><text class="xs mid" x="460" y="116">one range</text><text class="xs mid" x="460" y="129">per value</text>
+  <rect class="box green" x="513" y="100" width="94" height="38" rx="6"/><text class="xs mid" x="560" y="116">bounded range</text><text class="xs mid" x="560" y="129">exact $gt / $lt</text>
+  <text class="sm" x="10" y="100">Ranked, not cost-based.</text>
+  <text class="sm" x="10" y="116">$or, $ne, $exists and null</text>
+  <text class="sm" x="10" y="132">always scan.</text>
+  <text class="sm mid" x="460" y="164">candidate ids → every document re-checked against the full filter</text>
+</svg>
+<figcaption><b>Figure 17.</b> The index planner (<code>storage/secondary.rs</code>).</figcaption>
+</figure>
+
+<ul>
+  <li><b>Exact maintenance.</b> Every local write to an indexed collection goes through <code>apply_batch</code>, whether it comes
+  from a client, a hint, repair or a join. Under <code>index_write_lock</code> the node reads the document's current winning version.
+  If the incoming write wins, it writes tombstones for the old version's entries and live entries for the new one, at the new
+  version's timestamp. A late, older write leaves the index alone.</li>
+  <li><b>Verified results.</b> Every document an index finds is re-checked against the full filter, so an index can narrow the search
+  but never change the answer.</li>
+  <li><b>Schema.</b> Definitions travel in gossip, merged by last write wins, and are saved in <code>schema.json</code>. A node starts
+  maintaining a new index on every write at once, backfills existing documents in the background, and only uses the index once
+  that's done. A node that was down when an index was created builds it when it comes back. A dropped index stops being used
+  at once, and its entries are removed later by compaction.</li>
+  <li><b>Local only.</b> Index entries never appear in repair trees, streams or stats. Each node rebuilds its own.</li>
+</ul>
+
+<h2 id="cli-internals">21. Inside cassango-cli</h2>
+<figure>
+<svg class="d" viewBox="0 0 680 215">
+  <rect class="box gray" x="10" y="15" width="120" height="34" rx="6"/><text class="xs mid" x="70" y="36">REPL (rustyline)</text>
+  <rect class="box gray" x="10" y="59" width="120" height="34" rx="6"/><text class="xs mid" x="70" y="80">-e statement</text>
+  <rect class="box gray" x="10" y="103" width="120" height="34" rx="6"/><text class="xs mid" x="70" y="124">-f script file</text>
+  <rect class="box gray" x="10" y="147" width="120" height="34" rx="6"/><text class="xs mid" x="70" y="168">stdin / heredoc</text>
+  <rect class="box blue" x="160" y="55" width="120" height="86" rx="8"/>
+  <text class="b mid" x="220" y="75">statement reader</text><text class="xs mid" x="220" y="93">strip comments</text>
+  <text class="xs mid" x="220" y="107">balance brackets</text><text class="xs mid" x="220" y="121">and quotes</text>
+  <rect class="box violet" x="310" y="55" width="110" height="86" rx="8"/>
+  <text class="b mid" x="365" y="75">parse.rs</text><text class="xs mid" x="365" y="93">JSON5 arguments</text>
+  <text class="xs mid" x="365" y="107">→ Command enum</text><text class="xs mid" x="365" y="121">+ unit tests</text>
+  <rect class="box amber" x="450" y="55" width="100" height="86" rx="8"/>
+  <text class="b mid" x="500" y="75">client.rs</text><text class="xs mid" x="500" y="93">HTTP (reqwest)</text>
+  <text class="xs mid" x="500" y="107">failover across -H</text><text class="xs mid" x="500" y="121">?consistency=</text>
+  <rect class="box green" x="580" y="55" width="90" height="86" rx="8"/>
+  <text class="b mid" x="625" y="75">output.rs</text><text class="xs mid" x="625" y="93">pretty</text><text class="xs mid" x="625" y="107">table</text><text class="xs mid" x="625" y="121">json lines</text>
+  <rect class="box green" x="450" y="170" width="100" height="36" rx="8"/><text class="sm mid" x="500" y="192">cassango node</text>
+  <line class="ln" x1="130" y1="32" x2="158" y2="75"/><line class="ln" x1="130" y1="76" x2="158" y2="90"/>
+  <line class="ln" x1="130" y1="120" x2="158" y2="108"/><line class="ln" x1="130" y1="164" x2="158" y2="125"/>
+  <line class="ln" x1="280" y1="98" x2="308" y2="98"/><line class="ln" x1="420" y1="98" x2="448" y2="98"/><line class="ln" x1="550" y1="98" x2="578" y2="98"/>
+  <line class="ln2" x1="500" y1="141" x2="500" y2="168"/>
+</svg>
+<figcaption><b>Figure 18.</b> The shell's pipeline from input to output.</figcaption>
+</figure>
+<ul>
+  <li><code>main.rs</code>: flags, the REPL loop with history and multi-line input, script mode, exit codes, shell commands (<code>help</code>, <code>show</code>, <code>consistency</code>, …).</li>
+  <li><code>parse.rs</code>: turns <code>db.&lt;c&gt;.&lt;method&gt;(args)</code> chains such as <code>.sort().limit().consistency()</code> into a <code>Command</code>. JSON5 arguments make <code>{age: 31}</code> work. <code>is_complete</code> decides when a multi-line statement is finished.</li>
+  <li><code>client.rs</code>: one HTTP client over the public API. It tries hosts in order on connection errors.</li>
+  <li><code>output.rs</code>: pretty JSON, aligned tables (columns are the union of document keys, <code>_id</code> first), or JSON Lines.</li>
+</ul>
+
+<h2 id="driver-internals">22. Inside cassango-client</h2>
+<figure>
+<svg class="d" viewBox="0 0 680 260">
+  <rect class="box gray" x="10" y="20" width="205" height="220" rx="8"/>
+  <text class="b" x="22" y="40">your code</text>
+  <text class="mono" x="22" y="64">let c = Client::builder()</text>
+  <text class="mono" x="22" y="78">    .hosts([a, b, c])</text>
+  <text class="mono" x="22" y="92">    .build()?;</text>
+  <text class="mono" x="22" y="114">let users = c</text>
+  <text class="mono" x="22" y="128">  .collection::&lt;User&gt;("users");</text>
+  <text class="mono" x="22" y="150">users.find(Filter::new()</text>
+  <text class="mono" x="22" y="164">    .gte("age", 18))</text>
+  <text class="mono" x="22" y="178">  .limit(10)</text>
+  <text class="mono" x="22" y="192">  .await?</text>
+  <rect class="box blue" x="245" y="20" width="175" height="90" rx="8"/>
+  <text class="b mid" x="332" y="40">Client</text><text class="xs mid" x="332" y="56">Clone; shares an Arc</text>
+  <text class="xs mid" x="332" y="70">hosts + current host</text><text class="xs mid" x="332" y="84">reqwest pool · timeouts</text><text class="xs mid" x="332" y="98">default consistency</text>
+  <rect class="box green" x="245" y="125" width="175" height="55" rx="8"/>
+  <text class="b mid" x="332" y="145">Collection&lt;T&gt;</text><text class="xs mid" x="332" y="161">name · consistency · T: serde</text>
+  <rect class="box violet" x="245" y="195" width="175" height="45" rx="8"/>
+  <text class="b mid" x="332" y="214">Filter · Update · Find&lt;T&gt;</text><text class="xs mid" x="332" y="229">→ JSON · IntoFuture</text>
+  <rect class="box amber" x="450" y="20" width="190" height="90" rx="8"/>
+  <text class="b mid" x="545" y="40">send with failover</text><text class="xs mid" x="545" y="58">try the current host</text>
+  <text class="xs mid" x="545" y="72">connect error → next host,</text><text class="xs mid" x="545" y="86">and keep using it</text><text class="xs mid" x="545" y="100">other errors: no retry</text>
+  <rect class="box gray" x="450" y="125" width="190" height="55" rx="8"/>
+  <text class="b mid" x="545" y="145">status → Error</text><text class="xs mid" x="545" y="161">400 · 404 · 409 · 503 · 504</text><text class="xs mid" x="545" y="173">404 on a document → None</text>
+  <rect class="box green" x="450" y="195" width="220" height="45" rx="8"/>
+  <text class="b mid" x="560" y="214">cassango cluster</text><text class="xs mid" x="560" y="229">any node</text>
+  <line class="ln" x1="215" y1="78" x2="243" y2="65"/><line class="ln" x1="215" y1="128" x2="243" y2="150"/>
+  <line class="ln" x1="215" y1="160" x2="243" y2="215"/>
+  <line class="ln" x1="332" y1="125" x2="332" y2="112"/><line class="ln" x1="332" y1="195" x2="332" y2="182"/>
+  <line class="ln" x1="420" y1="65" x2="448" y2="65"/>
+  <line class="ln" x1="658" y1="110" x2="658" y2="193"/>
+  <line class="ln" x1="545" y1="195" x2="545" y2="182"/><text class="xs" x="550" y="190">response</text>
+</svg>
+<figcaption><b>Figure 19.</b> Driver structure. Every operation is one HTTP request to the public API.</figcaption>
+</figure>
+<ul>
+  <li><code>lib.rs</code>: <code>Client</code> and <code>ClientBuilder</code>, request sending with failover, <code>cluster()</code>, <code>ping()</code>, <code>refresh_hosts()</code>.</li>
+  <li><code>collection.rs</code>: <code>Collection&lt;T&gt;</code> and the <code>Find&lt;T&gt;</code> builder, which implements <code>IntoFuture</code> so a chain can be awaited directly.
+  <code>insert_many</code>, <code>update_many</code> and <code>delete_many</code> run up to 16 requests at a time with owned data, so their futures are <code>Send</code> and work with <code>tokio::spawn</code>.</li>
+  <li><code>query.rs</code>: <code>Filter</code>, <code>Update</code>, <code>Order</code>. Builders turn into <code>serde_json::Value</code>, and everything that takes a filter also takes plain JSON (<code>impl Into&lt;Value&gt;</code>).</li>
+  <li><code>types.rs</code>: <code>FindResult</code>, <code>ClusterInfo</code>, <code>Member</code>, <code>IndexInfo</code>, <code>Replica</code>, <code>NodeInfo</code>.</li>
+  <li><code>error.rs</code>: the <code>Error</code> enum, status mapping and <code>is_retryable()</code>.</li>
+</ul>
+
+<h2 id="testing">23. Building and testing</h2>
+<pre><code>cargo build --release                   <span class="c"># server + shell</span>
+cargo test --workspace                  <span class="c"># unit, doc and driver integration tests</span>
+cargo clippy --workspace --all-targets  <span class="c"># expected: no warnings</span>
+scripts/e2e.sh                          <span class="c"># end-to-end: 73 checks on a 4–5 node cluster (~40 s)</span></code></pre>
+<table>
+  <tr><th style="width:24%">Layer</th><th>What it covers</th></tr>
+  <tr><td>Unit tests</td><td>Ring hashing and ranges, query matching and updates, commit log replay and torn tails, SSTable round trips and CRCs,
+  merge and tombstone rules, index encoding and planner bounds, Merkle trees, CLI parsing.</td></tr>
+  <tr><td><code>tests/driver.rs</code></td><td>Starts the real server binary (<code>CARGO_BIN_EXE_cassango</code>) and runs typed CRUD, queries, indexes, errors,
+  failover, and a check that driver futures are <code>Send</code>.</td></tr>
+  <tr><td><code>scripts/e2e.sh</code></td><td>Real multi-node clusters: documents, replication and node failure with hinted handoff, deletes, on-disk storage across
+  restarts, anti-entropy repair, join, decommission, removenode and cleanup, index build, use and drop, the shell and its exit codes, and the driver example.</td></tr>
+</table>
+<h3>Conventions</h3>
+<ul>
+  <li>Never hold a lock across <code>.await</code>. Move blocking storage work to the storage thread or <code>spawn_blocking</code>.</li>
+  <li>Every write that reaches a replica must go through <code>apply_batch</code>, or index maintenance breaks.</li>
+  <li>Changing the SSTable or commit log format needs a version bump: the footer carries <code>version</code> and <code>magic</code>.</li>
+  <li>Node-to-node endpoints live under <code>/internal</code> and aren't part of the public API.</li>
+</ul>

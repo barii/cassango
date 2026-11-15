@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>cassango — User and Developer Guide</title>
+<style>
+@page {
+  size: A4;
+  margin: 18mm 17mm 20mm 17mm;
+  @bottom-left { content: "cassango — User and Developer Guide"; font: 8pt -apple-system, "Helvetica Neue", Arial, sans-serif; color: #9ca3af; }
+  @bottom-right { content: counter(page); font: 8pt -apple-system, "Helvetica Neue", Arial, sans-serif; color: #6b7280; }
+}
+@page cover { margin: 0; @bottom-left { content: none; } @bottom-right { content: none; } }
+
+:root {
+  --ink: #1f2937; --muted: #6b7280; --rule: #e5e7eb; --accent: #2563eb; --code-bg: #f6f8fa;
+}
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { margin: 0; color: var(--ink); background: #fff;
+  font: 10pt/1.5 -apple-system, "Helvetica Neue", Arial, sans-serif; }
+
+/* cover */
+.cover { page: cover; height: 297mm; padding: 0; position: relative; overflow: hidden;
+  background: linear-gradient(160deg, #0f172a 0%, #1e3a8a 60%, #2563eb 100%); color: #fff; break-after: page; }
+.cover .inner { position: absolute; left: 22mm; right: 22mm; top: 62mm; }
+.cover h1 { font-size: 54pt; letter-spacing: -1.5pt; margin: 0 0 4mm; font-weight: 800; border: 0; color: #fff; }
+.cover .sub { font-size: 17pt; font-weight: 300; margin: 0 0 14mm; color: #dbeafe; line-height: 1.35; }
+.cover .meta { font-size: 10pt; color: #bfdbfe; line-height: 1.8; }
+.cover .art { position: absolute; right: -45mm; bottom: -55mm; width: 150mm; opacity: .9; }
+.cover .parts { margin-top: 12mm; display: flex; gap: 6mm; }
+.cover .parts div { border: 1px solid rgba(255,255,255,.35); border-radius: 3mm; padding: 4mm 5mm; width: 52mm; font-size: 9.5pt; color: #e0e7ff; }
+.cover .parts b { display: block; color: #fff; font-size: 11pt; margin-bottom: 1mm; }
+
+/* toc */
+.toc { break-after: page; }
+.toc h2 { border: 0; margin-top: 0; }
+.toc ol { list-style: none; padding: 0; margin: 0; }
+.toc li { display: flex; align-items: baseline; padding: 1.1mm 0; }
+.toc li.part { font-weight: 700; color: var(--accent); margin-top: 4mm; font-size: 11pt; }
+.toc li .dots { flex: 1; border-bottom: 1px dotted #cbd5e1; margin: 0 2mm; transform: translateY(-2pt); }
+.toc li .pg { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 6mm; text-align: right; }
+.toc li.sub { padding-left: 6mm; font-size: 9.5pt; }
+
+/* headings */
+.part-title { break-before: page; padding-top: 40mm; }
+.part-title .kicker { color: var(--accent); font-weight: 700; letter-spacing: 2pt; text-transform: uppercase; font-size: 10pt; }
+.part-title h1 { font-size: 32pt; margin: 2mm 0 6mm; border: 0; letter-spacing: -.5pt; }
+.part-title p { font-size: 12pt; color: #374151; max-width: 140mm; }
+h1 { font-size: 20pt; }
+h2 { font-size: 15pt; margin: 9mm 0 3mm; padding-bottom: 1.5mm; border-bottom: 1.5px solid var(--rule); break-after: avoid; }
+h2.newpage { break-before: page; margin-top: 0; }
+h3 { font-size: 11.5pt; margin: 6mm 0 2mm; break-after: avoid; }
+h4 { font-size: 10pt; margin: 4mm 0 1mm; break-after: avoid; color: #374151; }
+p { margin: 0 0 2.5mm; }
+a { color: var(--accent); text-decoration: none; }
+ul, ol { margin: 0 0 3mm; padding-left: 5mm; }
+li { margin: .6mm 0; }
+
+code { font: 8.6pt/1.4 Menlo, "SF Mono", Consolas, monospace; background: var(--code-bg); padding: .2mm 1mm; border-radius: 1mm; }
+pre { background: var(--code-bg); border: 1px solid #e5e7eb; border-radius: 2mm; padding: 3mm 3.5mm; margin: 0 0 3.5mm;
+  font: 7.7pt/1.45 Menlo, "SF Mono", Consolas, monospace; white-space: pre-wrap; }
+pre code { background: none; padding: 0; font: inherit; }
+pre .c { color: #6b7280; }
+pre .k { color: #7c3aed; }
+pre .s { color: #047857; }
+
+table { border-collapse: collapse; width: 100%; margin: 0 0 4mm; font-size: 9pt; break-inside: auto; }
+th, td { text-align: left; padding: 1.4mm 2mm; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { background: #f3f4f6; font-weight: 600; border-bottom: 1.5px solid #d1d5db; }
+tr { break-inside: avoid; }
+td code, th code { font-size: 8.2pt; }
+
+.note { border-left: 3px solid var(--accent); background: #eff6ff; padding: 2.5mm 4mm; margin: 0 0 4mm; border-radius: 0 2mm 2mm 0; break-inside: avoid; }
+.warn { border-left-color: #d97706; background: #fffbeb; }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
+
+figure { margin: 3mm 0 6mm; break-inside: avoid; }
+figcaption { font-size: 8.5pt; color: var(--muted); margin-top: 1.5mm; text-align: center; }
+figcaption b { color: var(--ink); }
+
+/* diagrams */
+svg.d { width: 100%; height: auto; display: block; }
+.d text { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; font-size: 12px; fill: #1f2937; }
+.d .sm { font-size: 10.5px; fill: #374151; }
+.d .xs { font-size: 9.5px; fill: #4b5563; }
+.d .b { font-weight: 700; }
+.d .mono { font-family: Menlo, "SF Mono", monospace; font-size: 9.5px; white-space: pre; }
+.d .mid { text-anchor: middle; }
+.d .end { text-anchor: end; }
+.d .white { fill: #fff; }
+.box { fill: #fff; stroke: #9ca3af; stroke-width: 1.2; }
+.blue { fill: #dbeafe; stroke: #3b82f6; }
+.green { fill: #d1fae5; stroke: #10b981; }
+.amber { fill: #fef3c7; stroke: #f59e0b; }
+.red { fill: #fee2e2; stroke: #ef4444; }
+.violet { fill: #ede9fe; stroke: #8b5cf6; }
+.gray { fill: #f3f4f6; stroke: #9ca3af; }
+.frame { fill: #f9fafb; stroke: #d1d5db; stroke-width: 1.2; }
+.ln { stroke: #4b5563; stroke-width: 1.3; fill: none; marker-end: url(#ah); }
+.ln2 { stroke: #4b5563; stroke-width: 1.3; fill: none; marker-start: url(#ah); marker-end: url(#ah); }
+.lg { stroke: #059669; stroke-width: 1.6; fill: none; marker-end: url(#ahg); }
+.lb { stroke: #2563eb; stroke-width: 1.6; fill: none; marker-end: url(#ahb); }
+.la { stroke: #d97706; stroke-width: 1.6; fill: none; marker-end: url(#aha); }
+.lr { stroke: #dc2626; stroke-width: 1.6; fill: none; marker-end: url(#ahr); }
+.plain { stroke: #9ca3af; stroke-width: 1.2; fill: none; }
+.dash { stroke-dasharray: 4 3; }
+.life { stroke: #9ca3af; stroke-width: 1; stroke-dasharray: 3 3; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <marker id="ah"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/></marker>
+    <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+    <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+    <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/></marker>
+  </defs>
+</svg>
+
+<!-- ============================================================ COVER -->
+<section class="cover">
+  <svg class="art" viewBox="0 0 400 400">
+    <circle cx="200" cy="200" r="150" fill="none" stroke="rgba(255,255,255,.25)" stroke-width="2" stroke-dasharray="6 6"/>
+    <circle cx="200" cy="200" r="95" fill="none" stroke="rgba(255,255,255,.12)" stroke-width="1.5"/>
+    <g fill="rgba(255,255,255,.18)" stroke="rgba(255,255,255,.7)" stroke-width="2">
+      <circle cx="200" cy="50" r="22"/><circle cx="330" cy="125" r="22"/><circle cx="330" cy="275" r="22"/>
+      <circle cx="200" cy="350" r="22"/><circle cx="70" cy="275" r="22"/><circle cx="70" cy="125" r="22"/>
+    </g>
+    <g stroke="rgba(255,255,255,.22)" stroke-width="1.2">
+      <line x1="200" y1="50" x2="330" y2="275"/><line x1="330" y1="125" x2="70" y2="275"/><line x1="200" y1="350" x2="70" y2="125"/>
+      <line x1="200" y1="50" x2="200" y2="350"/><line x1="70" y1="125" x2="330" y2="125"/>
+    </g>
+    <g font-family="Menlo, monospace" font-size="11" fill="rgba(255,255,255,.75)">
+      <text x="152" y="190">{ "_id": "ann",</text><text x="160" y="206">"age": 31 }</text>
+    </g>
+  </svg>
+  <div class="inner">
+    <h1>cassango</h1>
+    <p class="sub">A distributed JSON document database in Rust.<br>Cassandra-style distribution, MongoDB-style documents.</p>
+    <div class="meta">User and Developer Guide · version 0.1.0 · November 2026<br>
+      Server · cassango-cli shell · cassango-client Rust driver</div>
+    <div class="parts">
+      <div><b>Part I · User guide</b>Install, run, query with the shell, use the driver and the HTTP API, run a cluster.</div>
+      <div><b>Part II · Developer guide</b>Architecture, replication, gossip, storage engine, repair, node moves, indexes.</div>
+      <div><b>Appendices</b>A real service migrated from Cassandra, error reference, limitations.</div>
+    </div>
+  </div>
+</section>

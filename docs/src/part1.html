@@ -1,0 +1,640 @@
+<!--TOC-->
+
+<!-- ============================================================ PART I -->
+<section class="part-title" id="part1">
+  <div class="kicker">Part I</div>
+  <h1>User guide</h1>
+  <p>Everything you need to run cassango and use it from the shell, from Rust and over HTTP.
+  You don't need to know how it works inside. Part II covers that.</p>
+</section>
+
+<h2 id="what">1. What is cassango?</h2>
+
+<p>cassango is a small distributed database that stores <b>JSON documents</b>. It spreads and
+copies data across a cluster the way <b>Apache Cassandra</b> does. You query documents the way you
+query <b>MongoDB</b>.</p>
+
+<table>
+  <tr><th style="width:50%">From Cassandra</th><th>From MongoDB</th></tr>
+  <tr><td>Gossip membership and failure detection, seed nodes</td><td>Schemaless JSON documents with an <code>_id</code></td></tr>
+  <tr><td>Consistent-hash token ring with virtual nodes; no master, any node coordinates</td><td>Filters: <code>$eq $ne $gt $gte $lt $lte $in $nin $exists $size $not $and $or $nor</code>, dotted paths, array matching</td></tr>
+  <tr><td>Replication factor and tunable consistency: <code>one</code> / <code>quorum</code> / <code>all</code></td><td>Sort, skip, limit</td></tr>
+  <tr><td>Last-write-wins timestamps, tombstones, <code>gc_grace</code></td><td>Update operators <code>$set $unset $inc $push</code></td></tr>
+  <tr><td>Hinted handoff, read repair, Merkle-tree anti-entropy repair</td><td>Secondary indexes: equality, <code>$in</code>, ranges, arrays</td></tr>
+  <tr><td>Node lifecycle: bootstrap, decommission, removenode, cleanup</td><td>A <code>mongo</code>-style shell: <code>db.users.find({age: {$gt: 30}})</code></td></tr>
+  <tr><td>LSM storage: commit log → memtable → SSTables, bloom filters, compaction</td><td>An async Rust driver with typed collections</td></tr>
+</table>
+
+<p>You talk to cassango in one of three ways, all over HTTP with JSON bodies. Any node can take
+any request. The node you contact <i>coordinates</i> it, sending work to the nodes that hold the data.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 345">
+  <rect class="box blue" x="10" y="50" width="180" height="54" rx="8"/>
+  <text class="b mid" x="100" y="73">cassango-cli</text><text class="sm mid" x="100" y="90">interactive shell &amp; scripts</text>
+  <rect class="box blue" x="10" y="133" width="180" height="54" rx="8"/>
+  <text class="b mid" x="100" y="156">your Rust app</text><text class="sm mid" x="100" y="173">+ cassango-client driver</text>
+  <rect class="box blue" x="10" y="216" width="180" height="54" rx="8"/>
+  <text class="b mid" x="100" y="239">curl / any HTTP client</text><text class="sm mid" x="100" y="256">plain HTTP + JSON</text>
+  <text class="sm mid" x="100" y="305">any node can coordinate</text><text class="sm mid" x="100" y="319">any request</text>
+
+  <rect class="frame" x="240" y="8" width="430" height="330" rx="14"/>
+  <text class="b mid" x="455" y="28">cassango cluster · replication factor 3</text>
+  <circle cx="455" cy="170" r="100" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="5 4"/>
+  <g>
+    <circle class="green" cx="455" cy="70" r="27"/><text class="b mid" x="455" y="74">node1</text>
+    <circle class="green" cx="541.6" cy="120" r="27"/><text class="b mid" x="541.6" y="124">node2</text>
+    <circle class="green" cx="541.6" cy="220" r="27"/><text class="b mid" x="541.6" y="224">node3</text>
+    <circle class="green" cx="455" cy="270" r="27"/><text class="b mid" x="455" y="274">node4</text>
+    <circle class="green" cx="368.4" cy="220" r="27"/><text class="b mid" x="368.4" y="224">node5</text>
+    <circle class="green" cx="368.4" cy="120" r="27"/><text class="b mid" x="368.4" y="124">node6</text>
+  </g>
+  <text class="b mid" x="455" y="163">token ring</text>
+  <text class="sm mid" x="455" y="179">6 nodes × 16 vnodes</text>
+  <text class="sm mid" x="455" y="193">gossip every second</text>
+  <text class="sm mid" x="455" y="325">nodes gossip and forward work to each other over HTTP /internal/*</text>
+
+  <line class="lb" x1="190" y1="77" x2="340" y2="113"/>
+  <line class="lb" x1="190" y1="160" x2="341" y2="211"/>
+  <line class="lb" x1="190" y1="243" x2="427" y2="267"/>
+</svg>
+<figcaption><b>Figure 1.</b> Clients connect to any node over HTTP. Nodes find each other by gossip and share the data on a token ring.</figcaption>
+</figure>
+
+<h3>Words used in this guide</h3>
+<table>
+  <tr><th style="width:26%">Term</th><th>Meaning</th></tr>
+  <tr><td>Document</td><td>A JSON object. Its <code>_id</code> (a string) is the key. If you leave it out, a UUID is generated.</td></tr>
+  <tr><td>Collection</td><td>A named group of documents, like a MongoDB collection or a Cassandra table. It's created by the first write. Names use <code>[A-Za-z0-9_-]</code>.</td></tr>
+  <tr><td>Node</td><td>One running <code>cassango</code> server process.</td></tr>
+  <tr><td>Replication factor (RF)</td><td>How many nodes store each document. The default is 3.</td></tr>
+  <tr><td>Replica</td><td>A node that stores a given document.</td></tr>
+  <tr><td>Coordinator</td><td>The node that received your request. It forwards work to the replicas and collects the answers.</td></tr>
+  <tr><td>Consistency level</td><td>How many replicas must answer before a read or write succeeds: <code>one</code>, <code>quorum</code> (a majority) or <code>all</code>.</td></tr>
+  <tr><td>Tombstone</td><td>The marker a delete writes. It's copied like a normal write and purged after <code>--gc-grace-secs</code>.</td></tr>
+</table>
+
+<h2 id="quickstart">2. Quick start</h2>
+
+<h3>Build</h3>
+<pre><code>cargo build --release        <span class="c"># target/release/cassango and target/release/cassango-cli</span></code></pre>
+
+<h3>Option A: a local cluster of processes</h3>
+<pre><code>scripts/cluster.sh start 3   <span class="c"># node1..node3 on 127.0.0.1:7001..7003, RF 3</span>
+target/release/cassango-cli  <span class="c"># opens the shell, connected to 127.0.0.1:7001</span></code></pre>
+
+<h3>Option B: six nodes in Docker</h3>
+<pre><code>docker build -t cassango:latest .
+docker compose up -d         <span class="c"># cassango1..cassango6, published on host ports 7001..7006</span>
+target/release/cassango-cli -H 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003</code></pre>
+
+<h3>First statements</h3>
+<pre><code>cassango shell — connected to 127.0.0.1:7001 (consistency quorum). Type 'help' for examples.
+cassango 127.0.0.1:7001&gt; db.users.insert({_id: "ann", name: "Ann Lee", age: 31, city: "Leeds"})
+inserted 1 document, _id: ann (4 ms)
+cassango 127.0.0.1:7001&gt; db.users.find({age: {$gt: 30}})
+{
+  "_id": "ann",
+  "name": "Ann Lee",
+  "age": 31,
+  "city": "Leeds"
+}
+1 of 1 matching document (3 ms)
+cassango 127.0.0.1:7001&gt; show cluster
+node   address         status  state   ownership_%  last_seen_s
+-----  --------------  ------  ------  -----------  -----------
+node1  127.0.0.1:7001  UP      NORMAL  33.28        0.0
+node2  127.0.0.1:7002  UP      NORMAL  28.99        0.5
+node3  127.0.0.1:7003  UP      NORMAL  37.73        0.5
+coordinator node1 · RF 3 · pending hints 0 · range movements in progress: false</code></pre>
+
+<p>Run every example in this guide at once with the tour script:
+<code>target/release/cassango-cli -o table -f examples/tour.cassango</code>.
+<code>scripts/cluster.sh stop</code> stops the nodes. <code>scripts/cluster.sh clean</code> stops them and deletes their data.</p>
+
+<h2 id="consistency">3. Replication and consistency</h2>
+
+<p>Every document is stored on <b>RF</b> nodes (3 by default). For every request you choose how many
+of those replicas must answer. With RF 3, <code>quorum</code> means 2. The default is <code>quorum</code>.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 215">
+  <g>
+    <rect class="box" x="5" y="5" width="215" height="203" rx="10"/>
+    <text class="b mid" x="112" y="27">one</text><text class="sm mid" x="112" y="43">wait for 1 of 3 replicas</text>
+    <line x1="70" y1="115" x2="156" y2="70" stroke="#059669" stroke-width="2.2"/>
+    <line class="plain dash" x1="70" y1="115" x2="156" y2="115"/>
+    <line class="plain dash" x1="70" y1="115" x2="156" y2="160"/>
+    <circle class="blue" cx="50" cy="115" r="20"/><text class="b mid" x="50" y="119">C</text>
+    <circle class="green" cx="172" cy="70" r="16"/><text class="mid sm" x="172" y="74">R1</text>
+    <circle class="gray" cx="172" cy="115" r="16"/><text class="mid sm" x="172" y="119">R2</text>
+    <circle class="gray" cx="172" cy="160" r="16"/><text class="mid sm" x="172" y="164">R3</text>
+    <text class="sm mid" x="112" y="198">works with 2 replicas down</text>
+  </g>
+  <g transform="translate(230,0)">
+    <rect class="box" x="5" y="5" width="215" height="203" rx="10"/>
+    <text class="b mid" x="112" y="27">quorum (default)</text><text class="sm mid" x="112" y="43">wait for 2 of 3 replicas</text>
+    <line x1="70" y1="115" x2="156" y2="70" stroke="#059669" stroke-width="2.2"/>
+    <line x1="70" y1="115" x2="156" y2="115" stroke="#059669" stroke-width="2.2"/>
+    <line class="plain dash" x1="70" y1="115" x2="156" y2="160"/>
+    <circle class="blue" cx="50" cy="115" r="20"/><text class="b mid" x="50" y="119">C</text>
+    <circle class="green" cx="172" cy="70" r="16"/><text class="mid sm" x="172" y="74">R1</text>
+    <circle class="green" cx="172" cy="115" r="16"/><text class="mid sm" x="172" y="119">R2</text>
+    <circle class="gray" cx="172" cy="160" r="16"/><text class="mid sm" x="172" y="164">R3</text>
+    <text class="sm mid" x="112" y="198">works with 1 replica down</text>
+  </g>
+  <g transform="translate(460,0)">
+    <rect class="box" x="5" y="5" width="215" height="203" rx="10"/>
+    <text class="b mid" x="112" y="27">all</text><text class="sm mid" x="112" y="43">wait for 3 of 3 replicas</text>
+    <line x1="70" y1="115" x2="156" y2="70" stroke="#059669" stroke-width="2.2"/>
+    <line x1="70" y1="115" x2="156" y2="115" stroke="#059669" stroke-width="2.2"/>
+    <line x1="70" y1="115" x2="156" y2="160" stroke="#059669" stroke-width="2.2"/>
+    <circle class="blue" cx="50" cy="115" r="20"/><text class="b mid" x="50" y="119">C</text>
+    <circle class="green" cx="172" cy="70" r="16"/><text class="mid sm" x="172" y="74">R1</text>
+    <circle class="green" cx="172" cy="115" r="16"/><text class="mid sm" x="172" y="119">R2</text>
+    <circle class="green" cx="172" cy="160" r="16"/><text class="mid sm" x="172" y="164">R3</text>
+    <text class="sm mid" x="112" y="198">fails if any replica is down</text>
+  </g>
+</svg>
+<figcaption><b>Figure 2.</b> The coordinator C sends to every live replica and returns once the consistency level is met.</figcaption>
+</figure>
+
+<ul>
+  <li><b>Write at quorum and read at quorum</b> and a read always sees the latest acknowledged write, because any two majorities overlap.</li>
+  <li>If too few replicas are <b>alive</b>, the request fails at once with <code>503 unavailable</code> and nothing is written.</li>
+  <li>If enough replicas are alive but don't answer in time, you get <code>504</code>. The write may have reached some replicas.</li>
+  <li>Writes for a replica that is down are queued on the coordinator (a <i>hint</i>) and delivered when it comes back.</li>
+  <li>Concurrent writes to one document are resolved by <b>last write wins</b>, using the timestamp the coordinator assigns.</li>
+</ul>
+
+<h2 id="shell">4. The shell: cassango-cli</h2>
+
+<pre><code>cassango-cli                                           <span class="c"># interactive shell (history: ~/.cassango_history)</span>
+cassango-cli -e 'db.users.count()'                     <span class="c"># run one statement and exit</span>
+cassango-cli -e 'db.a.insert({x: 1})' -e 'db.a.count()' <span class="c"># several statements</span>
+cassango-cli -f examples/tour.cassango                 <span class="c"># run a script file</span>
+echo 'db.users.find({city: "York"})' | cassango-cli    <span class="c"># statements from stdin</span>
+cassango-cli -H 10.0.0.5:7001,10.0.0.6:7001            <span class="c"># use the second host if the first is down</span>
+CASSANGO_HOST=10.0.0.5:7001 cassango-cli               <span class="c"># host from the environment</span></code></pre>
+
+<table>
+  <tr><th style="width:30%">Flag</th><th>Meaning</th></tr>
+  <tr><td><code>-H, --host &lt;list&gt;</code></td><td>Nodes to talk to, comma-separated. Later ones are used if earlier ones are unreachable. Default <code>127.0.0.1:7001</code> or <code>$CASSANGO_HOST</code>.</td></tr>
+  <tr><td><code>-e, --execute &lt;stmt&gt;</code></td><td>Run a statement and exit. Repeatable.</td></tr>
+  <tr><td><code>-f, --file &lt;path&gt;</code></td><td>Run a script file and exit.</td></tr>
+  <tr><td><code>-c, --consistency &lt;cl&gt;</code></td><td><code>one</code>, <code>quorum</code> (default) or <code>all</code>.</td></tr>
+  <tr><td><code>-o, --format &lt;fmt&gt;</code></td><td><code>pretty</code> (default), <code>table</code>, or <code>json</code> (JSON Lines and nothing else).</td></tr>
+  <tr><td><code>--continue-on-error</code></td><td>Keep running a script after a statement fails.</td></tr>
+</table>
+
+<h3>Syntax</h3>
+<ul>
+  <li>Arguments are <b>JSON5</b>: keys can be unquoted (<code>{age: 31}</code>), strings can use <code>'single quotes'</code>,
+  and trailing commas are fine. <b>Dotted keys need quotes:</b> <code>{"addr.city": "Leeds"}</code>.</li>
+  <li>A statement can span lines. The shell keeps reading (<code>...&gt;</code>) until brackets and quotes balance. Ctrl-C cancels a half-typed statement.</li>
+  <li><code>//</code> starts a comment anywhere outside a string. <code>#</code> and <code>--</code> start a comment at the beginning of a line. A trailing <code>;</code> is optional.</li>
+  <li>Interactively, <code>find()</code> without <code>.limit()</code> shows the first 20 documents and says how many more matched. Scripts and <code>-e</code> return everything.</li>
+</ul>
+
+<h3>Shell commands</h3>
+<table>
+  <tr><th style="width:34%">Command</th><th>What it does</th></tr>
+  <tr><td><code>help</code>, <code>help query</code>, <code>help update</code>, <code>help admin</code></td><td>Built-in examples</td></tr>
+  <tr><td><code>show cluster</code> (or <code>status</code>)</td><td>Nodes, UP/DOWN, lifecycle state, token ownership, pending hints</td></tr>
+  <tr><td><code>show collections</code></td><td>Collections and document counts on the connected node (including its replicas)</td></tr>
+  <tr><td><code>consistency [one|quorum|all]</code></td><td>Show or set the default consistency level</td></tr>
+  <tr><td><code>format [pretty|table|json]</code></td><td>Show or set the output format</td></tr>
+  <tr><td><code>timing [on|off]</code></td><td>Show the time each statement took (on by default interactively)</td></tr>
+  <tr><td><code>connect host:port[,host:port]</code></td><td>Switch to other node(s)</td></tr>
+  <tr><td><code>repair</code></td><td>Anti-entropy repair of the connected node's primary ranges</td></tr>
+  <tr><td><code>compact</code> / <code>compact major</code></td><td>Flush and compact the connected node's storage</td></tr>
+  <tr><td><code>cleanup</code></td><td>Drop data the connected node no longer owns (after a node joins)</td></tr>
+  <tr><td><code>exit</code> / <code>quit</code> / Ctrl-D</td><td>Leave the shell</td></tr>
+</table>
+
+<div class="note">There are no databases. A cluster has a single namespace of collections. To keep
+applications apart, prefix collection names, for example <code>billing_invoices</code>.</div>
+
+<h3>Collection methods</h3>
+<table>
+  <tr><th style="width:38%">Method</th><th>Example</th></tr>
+  <tr><td><code>insert(doc)</code></td><td><code>db.users.insert({name: "Ann"})</code></td></tr>
+  <tr><td><code>insertMany([docs])</code></td><td><code>db.users.insertMany([{name: "A"}, {name: "B"}])</code></td></tr>
+  <tr><td><code>get(id)</code></td><td><code>db.users.get("ann")</code></td></tr>
+  <tr><td><code>find(filter?)</code> + <code>.sort() .skip() .limit() .count() .explain()</code></td><td><code>db.users.find({age: {$gt: 30}}).sort({age: -1}).limit(5)</code></td></tr>
+  <tr><td><code>findOne(filter?)</code></td><td><code>db.users.findOne({city: "York"})</code></td></tr>
+  <tr><td><code>count(filter?)</code></td><td><code>db.users.count({city: "Leeds"})</code></td></tr>
+  <tr><td><code>update(id, update)</code></td><td><code>db.users.update("ann", {$inc: {visits: 1}})</code></td></tr>
+  <tr><td><code>updateMany(filter, update)</code></td><td><code>db.users.updateMany({city: "York"}, {$set: {region: "north"}})</code></td></tr>
+  <tr><td><code>replace(id, doc)</code></td><td><code>db.users.replace("ann", {name: "Ann", age: 32})</code></td></tr>
+  <tr><td><code>delete(id)</code> / <code>deleteMany(filter)</code></td><td><code>db.users.deleteMany({inactive: true})</code></td></tr>
+  <tr><td><code>createIndex(field)</code> / <code>dropIndex(field)</code> / <code>indexes()</code></td><td><code>db.users.createIndex("addr.city")</code></td></tr>
+  <tr><td><code>owners(id)</code></td><td><code>db.users.owners("ann")</code>: which nodes store the document</td></tr>
+  <tr><td><code>.consistency(cl)</code> on any method</td><td><code>db.users.get("ann").consistency("all")</code></td></tr>
+</table>
+
+<h2 id="queries">5. Working with documents</h2>
+
+<h3>Inserting</h3>
+<pre><code><span class="c">// Any JSON object. _id is optional; a UUID is generated if it's missing.</span>
+db.users.insert({_id: "ann", name: "Ann Lee", age: 31, city: "Leeds",
+                 tags: ["admin", "beta"], addr: {street: "1 Park Row", zip: "LS1"}})
+
+db.users.insertMany([
+  {_id: "bob", name: "Bob Hart", age: 25, city: "York",  tags: ["beta"], visits: 3},
+  {_id: "cat", name: "Cat Moss", age: 42, city: "Leeds", addr: {zip: "LS6"}, vip: true},
+  {_id: "dan", name: "Dan Webb", age: 17, city: "Hull",  visits: 12},
+  {_id: "eve", name: "Eve Shaw", age: 58, city: "York",  tags: [], vip: false},
+])</code></pre>
+<p><code>insert</code> is an <b>upsert</b>, as in Cassandra: inserting an existing <code>_id</code> replaces that document.</p>
+
+<h3>Reading</h3>
+<pre><code>db.users.get("ann")                  <span class="c">// by _id: reads only the replicas, the fastest lookup</span>
+db.users.findOne({city: "York"})     <span class="c">// first match</span>
+db.users.count()                     <span class="c">// 5</span>
+db.users.count({city: "Leeds"})      <span class="c">// 2</span></code></pre>
+
+<h3>Filters</h3>
+<table>
+  <tr><th style="width:40%">You want</th><th>Filter</th></tr>
+  <tr><td>equality</td><td><code>{city: "Leeds"}</code></td></tr>
+  <tr><td>a nested field</td><td><code>{"addr.zip": "LS1"}</code></td></tr>
+  <tr><td>an array containing a value</td><td><code>{tags: "beta"}</code></td></tr>
+  <tr><td>an array element by position</td><td><code>{"tags.0": "admin"}</code></td></tr>
+  <tr><td>a range</td><td><code>{age: {$gte: 18, $lt: 40}}</code></td></tr>
+  <tr><td>any of / none of</td><td><code>{city: {$in: ["York", "Hull"]}}</code>, <code>{city: {$nin: [...]}}</code></td></tr>
+  <tr><td>not equal</td><td><code>{age: {$ne: 31}}</code></td></tr>
+  <tr><td>a field that exists / is missing</td><td><code>{vip: {$exists: true}}</code>, <code>{addr: {$exists: false}}</code></td></tr>
+  <tr><td>null or missing</td><td><code>{nickname: null}</code></td></tr>
+  <tr><td>an array of a given length</td><td><code>{tags: {$size: 0}}</code></td></tr>
+  <tr><td>negation</td><td><code>{age: {$not: {$gte: 18}}}</code></td></tr>
+  <tr><td>either / both / neither</td><td><code>{$or: [...]}</code>, <code>{$and: [...]}</code>, <code>{$nor: [...]}</code></td></tr>
+</table>
+
+<pre><code>db.users.find({age: {$gte: 18, $lt: 40}})
+<span class="c">_id  name      age  city   tags              addr                                 visits
+---  --------  ---  -----  ----------------  -----------------------------------  ------
+ann  Ann Lee   31   Leeds  ["admin","beta"]  {"street":"1 Park Row","zip":"LS1"}
+bob  Bob Hart  25   York   ["beta"]                                               3
+2 of 2 matching documents</span>
+
+db.users.find({$or: [{age: {$lt: 18}}, {vip: true}]})      <span class="c">// cat and dan</span>
+db.users.find({tags: "beta"})                              <span class="c">// ann and bob: matches inside arrays</span>
+db.users.find({addr: {$exists: false}})                    <span class="c">// bob, dan, eve</span>
+db.products.find({price: {$lt: 20}, stock: {$gt: 0}})      <span class="c">// conditions are ANDed</span>
+db.products.find({ratings: {$gte: 5}})                     <span class="c">// any array element &gt;= 5</span></code></pre>
+
+<p>Comparisons only match values of the same type: <code>{age: {$gt: "30"}}</code> matches nothing
+when ages are numbers. Integers and floats compare as numbers (<code>31</code> equals <code>31.0</code>).</p>
+
+<h3>Sorting and paging</h3>
+<pre><code>db.users.find({}).sort({age: -1})                                  <span class="c">// oldest first</span>
+db.users.find({}).sort({city: 1, age: -1})                         <span class="c">// by city, then oldest first</span>
+db.products.find({category: "kitchen"}).sort({price: 1}).limit(2)  <span class="c">// two cheapest</span>
+db.users.find({}).sort({_id: 1}).skip(2).limit(2)                  <span class="c">// page 2, page size 2</span></code></pre>
+<p>Without a <code>sort</code>, results come back ordered by <code>_id</code>. Missing fields sort first, like <code>null</code>.
+For deep paging, prefer <b>keyset paging</b>: sort on a unique field and ask for <code>{field: {$gt: lastSeen}}</code>,
+rather than a large <code>skip</code>.</p>
+
+<h3>Updating</h3>
+<pre><code>db.users.update("bob", {$set: {city: "Leeds", "addr.zip": "LS2"}})  <span class="c">// set fields; creates addr</span>
+db.users.update("bob", {$inc: {visits: 1, age: 1}})                 <span class="c">// add to numbers</span>
+db.users.update("bob", {$push: {tags: "moved"}})                    <span class="c">// append to an array</span>
+db.users.update("bob", {$unset: {visits: ""}})                      <span class="c">// remove a field</span>
+db.products.updateMany({category: "living"}, {$set: {sale: true}})  <span class="c">// updated 2 documents</span>
+db.users.replace("eve", {name: "Eve Shaw", age: 59, city: "Hull"})  <span class="c">// replace the whole document</span></code></pre>
+<p><code>update</code> reads the document, applies the operators, writes the result and returns the new
+document. Two concurrent updates to the same document resolve by last write wins.
+<code>updateMany</code> and <code>deleteMany</code> find the matching ids first, then change them one by one.
+They refuse to run if some nodes are unreachable, because the list of matches could be incomplete.</p>
+
+<h3>Deleting</h3>
+<pre><code>db.users.delete("dan")                     <span class="c">// deleted dan</span>
+db.notes.deleteMany({pinned: true})        <span class="c">// deleted 1 document</span></code></pre>
+<p>A delete writes a <b>tombstone</b>. It's copied to the replicas like any other write and purged
+after <code>--gc-grace-secs</code> (10 days by default).</p>
+
+<h3>Indexes and explain()</h3>
+<p>Without an index, every node scans the whole collection. <code>explain()</code> shows what each node did:</p>
+<pre><code>db.people.find({city: "Ely", age: {$gt: 85}}).explain()
+<span class="c">node   plan       examined  matched
+node1  full scan  2000      27
+node2  full scan  2000      27
+node3  full scan  2000      27</span>
+
+db.people.createIndex("age")     <span class="c">// defined cluster-wide, built in the background on every node</span>
+db.people.indexes()
+<span class="c">field  created_ts        state
+age    1794680667212413  ready</span>
+
+db.people.find({city: "Ely", age: {$gt: 85}}).explain()
+<span class="c">node   plan       examined  matched
+node1  index age  158       27
+node2  index age  158       27
+node3  index age  158       27</span></code></pre>
+<p>Indexes serve equality, <code>$in</code>, and ranges (<code>$gt $gte $lt $lte</code>, on numbers or strings).
+If several conditions are indexed, the planner prefers equality, then <code>$in</code>, then ranges.
+Index a field that holds arrays and each element is indexed. Index nested fields with a dotted
+path: <code>createIndex("addr.city")</code>. Queries that use <code>$or</code>, <code>$ne</code>, <code>$exists</code> or <code>null</code> scan instead.</p>
+
+<h3>With a node down</h3>
+<pre><code>cassango 127.0.0.1:7001&gt; db.users.get("ann").consistency("all")
+error: 503 unavailable: 3 replicas required but only 2 alive
+
+cassango 127.0.0.1:7001&gt; db.users.find({city: "Leeds"})
+...
+3 of 3 matching documents — PARTIAL: some nodes were unreachable</code></pre>
+<p><code>PARTIAL</code> means <code>find</code> couldn't ask every node. With RF 3 and one node down, every
+document is still on two live nodes, so in practice nothing is missing.</p>
+
+<h2 id="scripting">6. Scripting and automation</h2>
+<p>Script files hold the same statements you'd type in the shell:</p>
+<pre><code><span class="c">// seed.cassango</span>
+db.users.insertMany([
+  {_id: "ann", name: "Ann", city: "Leeds"},
+  {_id: "bob", name: "Bob", city: "York"},
+])
+db.users.createIndex("city")
+db.users.count()</code></pre>
+<pre><code>cassango-cli -f seed.cassango                      <span class="c"># stops at the first error, exit code 1</span>
+cassango-cli -f seed.cassango --continue-on-error  <span class="c"># keep going; exit code 1 if anything failed</span>
+
+<span class="c"># -o json prints JSON Lines and nothing else, so it pipes cleanly</span>
+cassango-cli -o json -e 'db.people.find({age: {$gte: 89}}).limit(3)' | jq -c '{name, age}'
+cassango-cli -o json -e 'db.users.find({})' &gt; users.jsonl        <span class="c"># export</span>
+jq -c 'del(._id)' users.jsonl | sed 's/.*/db.users_copy.insert(&amp;)/' | cassango-cli   <span class="c"># import</span>
+
+cassango-cli &lt;&lt;'EOF'
+db.orders.insert({_id: "o1", user: "ann", total: 42.5})
+db.orders.find({total: {$gt: 40}})
+EOF</code></pre>
+<p>Exit codes: <code>0</code> success, <code>1</code> a statement failed (bad syntax, server error, cluster unreachable), <code>2</code> bad command-line flags.</p>
+
+<h2 id="driver">7. The Rust driver: cassango-client</h2>
+
+<pre><code>[dependencies]
+cassango-client = { path = "../cassango/client" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }</code></pre>
+
+<p>The driver is async and runs on tokio through reqwest. It doesn't depend on any server code.</p>
+
+<h3>Connecting</h3>
+<pre><code><span class="k">use</span> cassango_client::{Client, Consistency};
+<span class="k">use</span> std::time::Duration;
+
+<span class="k">let</span> client = Client::new(<span class="s">"127.0.0.1:7001"</span>)?;                     <span class="c">// one host, defaults</span>
+
+<span class="k">let</span> client = Client::builder()
+    .hosts([<span class="s">"10.0.0.5:7001"</span>, <span class="s">"10.0.0.6:7001"</span>, <span class="s">"10.0.0.7:7001"</span>])  <span class="c">// tried in order if one is down</span>
+    .consistency(Consistency::Quorum)                          <span class="c">// default for reads and writes</span>
+    .timeout(Duration::from_secs(10))                          <span class="c">// per request (default 30 s)</span>
+    .connect_timeout(Duration::from_secs(1))                   <span class="c">// before trying the next host</span>
+    .build()?;
+
+client.refresh_hosts().await?;   <span class="c">// replace the list with every UP node the cluster reports</span></code></pre>
+<p><code>Client</code> is cheap to clone and safe to share across tasks. Clones share connections.</p>
+
+<h3>A complete program</h3>
+<pre><code><span class="k">use</span> cassango_client::{Client, Filter, Order, Update};
+<span class="k">use</span> serde::{Deserialize, Serialize};
+<span class="k">use</span> serde_json::json;
+
+#[derive(Debug, Serialize, Deserialize)]
+<span class="k">struct</span> User {
+    #[serde(rename = <span class="s">"_id"</span>)]   <span class="c">// map a field to the document id</span>
+    id: String,
+    name: String,
+    age: u32,
+    city: String,
+}
+
+#[tokio::main]
+<span class="k">async fn</span> main() -&gt; cassango_client::Result&lt;()&gt; {
+    <span class="k">let</span> client = Client::builder().hosts([<span class="s">"127.0.0.1:7001"</span>, <span class="s">"127.0.0.1:7002"</span>]).build()?;
+    <span class="k">let</span> users = client.collection::&lt;User&gt;(<span class="s">"users"</span>);
+
+    <span class="k">let</span> ann = User { id: <span class="s">"ann"</span>.into(), name: <span class="s">"Ann"</span>.into(), age: 31, city: <span class="s">"Leeds"</span>.into() };
+    users.insert(&amp;ann).await?;
+    <span class="k">let</span> found: Option&lt;User&gt; = users.get(<span class="s">"ann"</span>).await?;
+
+    <span class="k">let</span> leeds = users
+        .find(Filter::new().eq(<span class="s">"city"</span>, <span class="s">"Leeds"</span>).gte(<span class="s">"age"</span>, 18))   <span class="c">// or json!({...})</span>
+        .sort_by(<span class="s">"age"</span>, Order::Desc)
+        .limit(10)
+        .await?;
+    println!(<span class="s">"{} of {} matches"</span>, leeds.docs.len(), leeds.matched);
+
+    users.update(<span class="s">"ann"</span>, Update::new().inc(<span class="s">"age"</span>, 1)).await?;
+    <span class="k">let</span> adults = users.count(json!({<span class="s">"age"</span>: {<span class="s">"$gte"</span>: 18}})).await?;
+    users.delete(<span class="s">"ann"</span>).await?;
+    Ok(())
+}</code></pre>
+
+<h3>Collection methods</h3>
+<p>Choose the document type with the turbofish: your own serde struct, or <code>serde_json::Value</code> for schemaless documents.</p>
+<table>
+  <tr><th style="width:34%">Method</th><th style="width:22%">Returns</th><th>Notes</th></tr>
+  <tr><td><code>insert(&amp;doc)</code></td><td><code>String</code> (the <code>_id</code>)</td><td>Upsert. An <code>_id</code> is generated if the document has none</td></tr>
+  <tr><td><code>insert_many(&amp;[docs])</code></td><td><code>Vec&lt;String&gt;</code></td><td>Up to 16 at a time; ids in input order</td></tr>
+  <tr><td><code>put(id, &amp;doc)</code></td><td><code>()</code></td><td>Insert or replace by id</td></tr>
+  <tr><td><code>get(id)</code></td><td><code>Option&lt;T&gt;</code></td><td><code>None</code> if missing or deleted</td></tr>
+  <tr><td><code>update(id, update)</code></td><td><code>Option&lt;T&gt;</code></td><td>The updated document; <code>None</code> if missing</td></tr>
+  <tr><td><code>delete(id)</code></td><td><code>()</code></td><td>Deleting a missing document is fine</td></tr>
+  <tr><td><code>find(filter)</code> / <code>find_all()</code></td><td><code>Find&lt;T&gt;</code> builder</td><td><code>.sort() .sort_by() .skip() .limit() .explain()</code>, then <code>.await</code></td></tr>
+  <tr><td><code>find_one(filter)</code></td><td><code>Option&lt;T&gt;</code></td><td></td></tr>
+  <tr><td><code>count(filter)</code></td><td><code>usize</code></td><td>Across the cluster</td></tr>
+  <tr><td><code>update_many</code> / <code>delete_many</code></td><td><code>usize</code></td><td>Finds ids, then changes each one (not atomic)</td></tr>
+  <tr><td><code>create_index</code> / <code>drop_index</code></td><td><code>bool</code></td><td><code>true</code> if created / dropped</td></tr>
+  <tr><td><code>indexes()</code></td><td><code>Vec&lt;IndexInfo&gt;</code></td><td>Build state on the current node</td></tr>
+  <tr><td><code>wait_for_index(field, timeout)</code></td><td><code>()</code></td><td>Until the index is ready on every UP node</td></tr>
+  <tr><td><code>owners(id)</code></td><td><code>Vec&lt;Replica&gt;</code></td><td>Nodes storing the document</td></tr>
+  <tr><td><code>with_consistency(cl)</code></td><td><code>Collection&lt;T&gt;</code></td><td>Same collection, another consistency level</td></tr>
+  <tr><td><code>typed::&lt;U&gt;()</code></td><td><code>Collection&lt;U&gt;</code></td><td>Same collection, another document type</td></tr>
+</table>
+
+<h3>Filters and updates</h3>
+<pre><code><span class="k">let</span> f = Filter::new()
+    .is_in(<span class="s">"city"</span>, [<span class="s">"York"</span>, <span class="s">"Hull"</span>])
+    .exists(<span class="s">"email"</span>, true)
+    .or([Filter::new().lt(<span class="s">"age"</span>, 18), Filter::new().eq(<span class="s">"vip"</span>, true)]);
+<span class="k">let</span> n = users.count(f).await?;
+<span class="c">// Filter: eq ne gt gte lt lte is_in not_in exists size or nor
+// Operators on one field merge: .gte("age", 18).lt("age", 65) → {"age": {"$gte": 18, "$lt": 65}}</span>
+
+<span class="k">let</span> bob = users.update(<span class="s">"bob"</span>, Update::new()
+        .set(<span class="s">"addr.city"</span>, <span class="s">"Leeds"</span>)   <span class="c">// dotted paths create nested objects</span>
+        .inc(<span class="s">"visits"</span>, 1)
+        .push(<span class="s">"tags"</span>, <span class="s">"moved"</span>)
+        .unset(<span class="s">"nickname"</span>))
+    .await?;                         <span class="c">// Some(updated) or None</span>
+
+users.create_index(<span class="s">"age"</span>).await?;
+users.wait_for_index(<span class="s">"age"</span>, Duration::from_secs(30)).await?;
+<span class="k">let</span> r = users.find(Filter::new().gt(<span class="s">"age"</span>, 30)).explain().await?;</code></pre>
+
+<h3>Errors</h3>
+<p>Every method returns <code>cassango_client::Result&lt;T&gt;</code>. <code>err.is_retryable()</code> is true for
+<code>Unavailable</code>, <code>Timeout</code>, <code>Transport</code> and <code>Partial</code>.</p>
+<table>
+  <tr><th style="width:20%">Variant</th><th>When</th></tr>
+  <tr><td><code>BadRequest</code></td><td>Invalid filter, update, document or collection name (400)</td></tr>
+  <tr><td><code>NotFound</code></td><td>Missing index or node on admin calls (404). Missing documents return <code>None</code> instead</td></tr>
+  <tr><td><code>Conflict</code></td><td>Something conflicting is already in progress (409)</td></tr>
+  <tr><td><code>Unavailable</code></td><td>Too few replicas alive for the consistency level; nothing was written (503)</td></tr>
+  <tr><td><code>Timeout</code></td><td>Replicas didn't acknowledge in time; the write may be partially applied (504)</td></tr>
+  <tr><td><code>Transport</code></td><td>No host reachable, or the connection broke</td></tr>
+  <tr><td><code>Serde</code></td><td>A document didn't match your type</td></tr>
+  <tr><td><code>Partial</code></td><td><code>update_many</code> / <code>delete_many</code> refused because some nodes were unreachable</td></tr>
+</table>
+
+<div class="note warn">The driver turns on serde_json's <code>preserve_order</code> feature, so
+<code>json!({"a": 1, "b": -1})</code> sort specs keep the order you wrote them in. Cargo features are
+shared across a build, so <code>serde_json::Map</code> keeps insertion order in your whole project too.</div>
+
+<h2 id="http">8. The HTTP API</h2>
+<p>The shell and the driver are thin clients over this API, and you can call it directly. Document
+endpoints accept <code>?consistency=one|quorum|all</code> (default <code>quorum</code>).</p>
+<table>
+  <tr><th style="width:40%">Method and path</th><th>Purpose</th></tr>
+  <tr><td><code>POST /collections/{c}/docs</code></td><td>Insert (an <code>_id</code> is generated if absent) → <code>{"_id": ...}</code></td></tr>
+  <tr><td><code>GET /collections/{c}/docs/{id}</code></td><td>Get a document</td></tr>
+  <tr><td><code>PUT /collections/{c}/docs/{id}</code></td><td>Insert or replace</td></tr>
+  <tr><td><code>PATCH /collections/{c}/docs/{id}</code></td><td>Apply update operators; returns the new document</td></tr>
+  <tr><td><code>DELETE /collections/{c}/docs/{id}</code></td><td>Delete</td></tr>
+  <tr><td><code>POST /collections/{c}/find</code></td><td><code>{filter, sort, skip, limit, explain}</code> → <code>{docs, matched, partial}</code></td></tr>
+  <tr><td><code>POST /collections/{c}/indexes</code></td><td><code>{"field": "..."}</code>: create an index</td></tr>
+  <tr><td><code>GET /collections/{c}/indexes</code></td><td>Indexes and their build state on this node</td></tr>
+  <tr><td><code>DELETE /collections/{c}/indexes/{field}</code></td><td>Drop an index</td></tr>
+  <tr><td><code>GET /</code></td><td>Node id, version, state, replication factor</td></tr>
+  <tr><td><code>GET /cluster</code></td><td>Members, UP/DOWN, state, ownership, pending hints</td></tr>
+  <tr><td><code>GET /cluster/owners/{c}/{id}</code></td><td>Replicas for a document</td></tr>
+  <tr><td><code>GET /collections</code></td><td>Local document counts and storage stats</td></tr>
+  <tr><td><code>POST /admin/repair</code>, <code>GET /admin/repair</code></td><td>Run a repair / last report</td></tr>
+  <tr><td><code>POST /admin/compact[?major=true]</code></td><td>Flush and compact</td></tr>
+  <tr><td><code>POST /admin/cleanup</code></td><td>Drop data this node no longer owns</td></tr>
+  <tr><td><code>POST /admin/decommission</code></td><td>Leave the cluster, handing data over</td></tr>
+  <tr><td><code>POST /admin/removenode/{id}</code></td><td>Remove a dead node</td></tr>
+</table>
+<pre><code>curl -XPOST localhost:7001/collections/users/docs -H 'content-type: application/json' \
+     -d '{"name":"ann","age":31,"addr":{"city":"Leeds"}}'
+<span class="c"># {"_id":"6f1c..."}</span>
+curl 'localhost:7002/collections/users/docs/ann?consistency=one'
+curl -XPATCH localhost:7001/collections/users/docs/ann -H 'content-type: application/json' \
+     -d '{"$inc":{"age":1},"$set":{"addr.zip":"LS1"}}'
+curl -XPOST localhost:7003/collections/users/find -H 'content-type: application/json' -d '{
+  "filter": {"addr.city": "Leeds", "age": {"$gte": 30}},
+  "sort": {"age": -1}, "skip": 0, "limit": 10, "explain": true }'
+<span class="c"># {"docs":[...],"matched":1,"partial":false,"explain":{"node1":{"index":null,"examined":4,...},...}}</span></code></pre>
+<p>Errors come back as <code>{"error": "..."}</code> with status <code>400</code>, <code>404</code>, <code>409</code>, <code>503</code> or <code>504</code>. Appendix B lists them all.</p>
+
+<h2 id="operating">9. Running a cluster</h2>
+
+<h3>Local processes: scripts/cluster.sh</h3>
+<pre><code>scripts/cluster.sh start 3          <span class="c"># node1..node3 on ports 7001..7003 (data/ and logs/)</span>
+scripts/cluster.sh status           <span class="c"># cluster view from node1 (JSON)</span>
+scripts/cluster.sh kill 2           <span class="c"># hard-kill node2</span>
+scripts/cluster.sh restart 2        <span class="c"># start it again</span>
+scripts/cluster.sh join 4           <span class="c"># add node4; it streams its share of the data</span>
+scripts/cluster.sh cleanup          <span class="c"># drop data the old owners gave away after a join</span>
+scripts/cluster.sh decommission 2   <span class="c"># node2 hands its data to the others and stops</span>
+scripts/cluster.sh removenode node3 <span class="c"># node3 is dead for good: copy its data from the survivors</span>
+scripts/cluster.sh repair           <span class="c"># anti-entropy repair on every node</span>
+scripts/cluster.sh stop             <span class="c"># stop everything (memtables are flushed)</span>
+scripts/cluster.sh clean            <span class="c"># stop and delete data/ and logs/</span></code></pre>
+<p>Environment variables: <code>RF</code>, <code>MEMTABLE_MB</code>, <code>RING_DELAY_MS</code>, <code>EXTRA_ARGS</code>.</p>
+
+<h3>Docker: six nodes with docker compose</h3>
+<figure>
+<svg class="d" viewBox="0 0 680 300">
+  <rect class="frame" x="5" y="5" width="670" height="290" rx="12"/>
+  <text class="b" x="20" y="25">your machine</text>
+  <rect x="205" y="38" width="460" height="248" rx="10" fill="#eff6ff" stroke="#93c5fd" stroke-dasharray="5 4"/>
+  <text class="sm b" x="218" y="56">docker network "cassango" · image cassango:latest</text>
+  <g>
+    <rect class="box green" x="218" y="68" width="138" height="96" rx="8"/>
+    <text class="b mid" x="287" y="88">cassango1</text><text class="xs mid" x="287" y="103">seed · :7000 → host :7001</text>
+    <rect class="amber" x="238" y="118" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="287" y="137">volume cassango1-data</text>
+    <rect class="box green" x="367" y="68" width="138" height="96" rx="8"/>
+    <text class="b mid" x="436" y="88">cassango2</text><text class="xs mid" x="436" y="103">seed · :7000 → host :7002</text>
+    <rect class="amber" x="387" y="118" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="436" y="137">volume cassango2-data</text>
+    <rect class="box green" x="516" y="68" width="138" height="96" rx="8"/>
+    <text class="b mid" x="585" y="88">cassango3</text><text class="xs mid" x="585" y="103">seed · :7000 → host :7003</text>
+    <rect class="amber" x="536" y="118" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="585" y="137">volume cassango3-data</text>
+    <rect class="box green" x="218" y="176" width="138" height="96" rx="8"/>
+    <text class="b mid" x="287" y="196">cassango4</text><text class="xs mid" x="287" y="211">:7000 → host :7004</text>
+    <rect class="amber" x="238" y="226" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="287" y="245">volume cassango4-data</text>
+    <rect class="box green" x="367" y="176" width="138" height="96" rx="8"/>
+    <text class="b mid" x="436" y="196">cassango5</text><text class="xs mid" x="436" y="211">:7000 → host :7005</text>
+    <rect class="amber" x="387" y="226" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="436" y="245">volume cassango5-data</text>
+    <rect class="box green" x="516" y="176" width="138" height="96" rx="8"/>
+    <text class="b mid" x="585" y="196">cassango6</text><text class="xs mid" x="585" y="211">:7000 → host :7006</text>
+    <rect class="amber" x="536" y="226" width="98" height="30" rx="4" stroke-width="1"/><text class="xs mid" x="585" y="245">volume cassango6-data</text>
+  </g>
+  <rect class="box blue" x="20" y="70" width="160" height="50" rx="8"/>
+  <text class="b mid" x="100" y="91">cassango-cli</text><text class="xs mid" x="100" y="107">-H 127.0.0.1:7001,…</text>
+  <rect class="box blue" x="20" y="140" width="160" height="50" rx="8"/>
+  <text class="b mid" x="100" y="161">your application</text><text class="xs mid" x="100" y="177">hosts 127.0.0.1:7001–7003</text>
+  <rect class="box gray" x="20" y="210" width="160" height="62" rx="8"/>
+  <text class="sm b mid" x="100" y="229">docker compose up -d</text><text class="xs mid" x="100" y="245">healthcheck: show cluster</text><text class="xs mid" x="100" y="259">stop: SIGINT, flushes memtable</text>
+  <line class="ln" x1="180" y1="95" x2="216" y2="104"/>
+  <line class="ln" x1="180" y1="165" x2="216" y2="150"/>
+</svg>
+<figcaption><b>Figure 3.</b> The Docker deployment: six containers on one network, each with its own volume and host port. The first three are seeds.</figcaption>
+</figure>
+<pre><code>docker build -t cassango:latest .      <span class="c"># multi-stage build: rust:slim → debian:bookworm-slim</span>
+docker compose up -d                   <span class="c"># RF 3, repair every 24 h (--repair-interval-secs 86400)</span>
+docker compose ps                      <span class="c"># all six should be "healthy"</span>
+docker compose stop cassango3          <span class="c"># simulate a failure; writes keep working at quorum</span>
+docker compose down                    <span class="c"># stop and remove the containers; the volumes are kept</span>
+docker compose down -v                 <span class="c"># ... and delete the data</span></code></pre>
+
+<h3>Walkthrough: failure, recovery, growth</h3>
+<pre><code><span class="c"># 1. A node fails. Writes keep working at quorum and are queued for it.</span>
+scripts/cluster.sh kill 2
+cassango-cli -e 'db.users.insert({_id: "zed", name: "Zed"})'
+cassango-cli -e 'show cluster'       <span class="c"># a few seconds later: node2 DOWN, "pending hints 1"</span>
+
+<span class="c"># 2. It comes back. The queued writes are delivered within a few seconds.</span>
+scripts/cluster.sh restart 2
+cassango-cli -e 'show cluster'       <span class="c"># node2 UP, "pending hints 0"</span>
+
+<span class="c"># 3. Make sure all replicas agree, e.g. after a long outage.</span>
+scripts/cluster.sh repair            <span class="c"># node1: ranges=16 in_sync=16 repaired=0 ...</span>
+
+<span class="c"># 4. Grow the cluster. node4 starts as JOINING, streams its ranges, then turns NORMAL.</span>
+scripts/cluster.sh join 4
+scripts/cluster.sh cleanup           <span class="c"># free the space the old owners no longer need</span>
+
+<span class="c"># 5. Shrink it again.</span>
+scripts/cluster.sh decommission 4    <span class="c"># streams node4's data away, marks it LEFT, stops it</span></code></pre>
+
+<h3>Server flags</h3>
+<pre><code>cassango --node-id n1 --listen 127.0.0.1:7001 --seeds 127.0.0.1:7001 --no-bootstrap
+cassango --node-id n2 --listen 127.0.0.1:7002 --seeds 127.0.0.1:7001</code></pre>
+<table>
+  <tr><th style="width:28%">Flag</th><th style="width:18%">Default</th><th>Meaning</th></tr>
+  <tr><td><code>--node-id</code></td><td>required</td><td>Unique, stable id. It determines the node's ring tokens</td></tr>
+  <tr><td><code>--listen</code></td><td><code>127.0.0.1:7001</code></td><td>Address for client and node-to-node traffic</td></tr>
+  <tr><td><code>--advertise</code></td><td><code>--listen</code></td><td>Address other nodes use to reach this one</td></tr>
+  <tr><td><code>--seeds</code></td><td></td><td>Comma-separated seed addresses</td></tr>
+  <tr><td><code>--data-dir</code></td><td><code>./data/&lt;node-id&gt;</code></td><td>Commit logs, SSTables and the schema</td></tr>
+  <tr><td><code>--replication-factor</code></td><td><code>3</code></td><td>Copies of each document. Must be the same on every node</td></tr>
+  <tr><td><code>--vnodes</code></td><td><code>16</code></td><td>Tokens per node</td></tr>
+  <tr><td><code>--gossip-interval-ms</code></td><td><code>1000</code></td><td>How often nodes gossip</td></tr>
+  <tr><td><code>--failure-timeout-ms</code></td><td><code>5000</code></td><td>A node is DOWN after this long without a newer heartbeat</td></tr>
+  <tr><td><code>--memtable-mb</code></td><td><code>16</code></td><td>Flush the memtable to an SSTable at about this size</td></tr>
+  <tr><td><code>--compaction-threshold</code></td><td><code>4</code></td><td>Merge SSTables once this many have a similar size</td></tr>
+  <tr><td><code>--gc-grace-secs</code></td><td><code>864000</code></td><td>Keep tombstones this long (10 days)</td></tr>
+  <tr><td><code>--no-bootstrap</code></td><td>off</td><td>Join without streaming data (first nodes of a new cluster)</td></tr>
+  <tr><td><code>--ring-delay-ms</code></td><td><code>5000</code></td><td>Wait for a status change to spread before streaming</td></tr>
+  <tr><td><code>--repair-interval-secs</code></td><td><code>0</code> (off)</td><td>Run repair automatically every N seconds</td></tr>
+  <tr><td><code>--fsync</code></td><td>off</td><td>fsync the commit log after every write batch</td></tr>
+</table>
+
+<div class="note warn"><b>Operational rules of thumb.</b> Run a repair on every node more often than
+<code>--gc-grace-secs</code>, otherwise a deleted document can come back. Change one node at a time:
+decommission, removenode and cleanup refuse to run while another node is joining or leaving.
+Stop nodes with SIGINT (Ctrl-C, or <code>docker compose stop</code>, which sends SIGINT) so they flush their memtables. After a crash,
+the commit log is replayed on startup.</div>

@@ -1,0 +1,90 @@
+<!-- ============================================================ APPENDICES -->
+<section class="part-title" id="appendices">
+  <div class="kicker">Appendices</div>
+  <h1>Reference</h1>
+  <p>A real service moved from Cassandra to cassango, the error reference, and what cassango leaves out.</p>
+</section>
+
+<h2 class="newpage" id="case-study">A. Case study: CustomerNotifications</h2>
+<p>The <code>SS.RMS.CustomerNotifications</code> service (branch <code>use-cassa</code>) originally stored its data in Cassandra through the
+scylla driver. It now uses cassango through <code>cassango-client</code>. It shows how Cassandra tables map to cassango collections.</p>
+
+<figure>
+<svg class="d" viewBox="0 0 680 265">
+  <rect class="box gray" x="10" y="30" width="150" height="80" rx="8"/>
+  <text class="b mid" x="85" y="52">Kafka</text><text class="xs mid" x="85" y="70">customer data topics in</text><text class="xs mid" x="85" y="84">customer.notification.tags out</text>
+  <rect class="box gray" x="10" y="140" width="150" height="80" rx="8"/>
+  <text class="b mid" x="85" y="162">UI</text><text class="xs mid" x="85" y="180">live &amp; historic websockets</text><text class="xs mid" x="85" y="194">daily counter · tagging</text>
+  <rect class="box blue" x="200" y="30" width="180" height="190" rx="8"/>
+  <text class="b mid" x="290" y="52">CustomerNotifications</text>
+  <text class="mono" x="212" y="78">customer_data_dal</text><text class="mono" x="212" y="96">notifications_by_date_dal</text>
+  <text class="mono" x="212" y="114">notifications_by_type_dal</text><text class="mono" x="212" y="132">tags_by_type_dal</text>
+  <text class="mono" x="212" y="158">connection.rs</text><text class="xs" x="212" y="172">connect · ensure_indexes · keys</text>
+  <text class="mono" x="212" y="194">run_retention</text><text class="xs" x="212" y="208">hourly: delete expired docs</text>
+  <rect class="box green" x="420" y="30" width="250" height="40" rx="6"/><text class="sm b" x="432" y="47">customer_data</text><text class="xs" x="432" y="61">indexes: pk, expires_at · one doc per data type</text>
+  <rect class="box green" x="420" y="80" width="250" height="40" rx="6"/><text class="sm b" x="432" y="97">notifications_by_date</text><text class="xs" x="432" y="111">indexes: pk, expires_at · paged on sort_key</text>
+  <rect class="box green" x="420" y="130" width="250" height="40" rx="6"/><text class="sm b" x="432" y="147">notifications_by_type</text><text class="xs" x="432" y="161">indexes: group_key, expires_at · counts</text>
+  <rect class="box green" x="420" y="180" width="250" height="40" rx="6"/><text class="sm b" x="432" y="197">tags_by_type</text><text class="xs" x="432" y="211">indexes: group_key, expires_at · counts</text>
+  <line class="ln" x1="160" y1="70" x2="198" y2="80"/><line class="ln2" x1="160" y1="180" x2="198" y2="170"/>
+  <line class="ln" x1="380" y1="80" x2="418" y2="50"/><line class="ln" x1="380" y1="100" x2="418" y2="100"/>
+  <line class="ln" x1="380" y1="120" x2="418" y2="150"/><line class="ln" x1="380" y1="140" x2="418" y2="200"/>
+  <text class="xs mid" x="340" y="250">quorum reads and writes · CASSANGO_HOSTS=host:port,… · indexes created at startup</text>
+</svg>
+<figcaption><b>Figure 20.</b> The service with cassango: one collection per former Cassandra table.</figcaption>
+</figure>
+
+<table>
+  <tr><th style="width:28%">Cassandra feature</th><th>cassango replacement</th></tr>
+  <tr><td>Table with a composite primary key</td><td>A collection. <code>_id</code> is the old primary key columns joined with <code>|</code> (escaped). Writing the same key again overwrites, exactly as before.</td></tr>
+  <tr><td>Partition key queries</td><td>An indexed <code>pk</code> or <code>group_key</code> field holding the old partition key. <code>IN</code> on partition keys becomes <code>{pk: {$in: [...]}}</code>.</td></tr>
+  <tr><td>Clustering order + paging state</td><td>A <code>sort_key</code> field: <code>{i64::MAX − millis:019}|{_id}</code>, so ascending order is newest first. The page token is the base64 of the last <code>sort_key</code>; the next page asks for <code>sort_key $gt token</code>.</td></tr>
+  <tr><td>One column per data type</td><td>One document per (customer, data type), so data types written concurrently don't overwrite each other.</td></tr>
+  <tr><td><code>SELECT … GROUP BY alert_type</code></td><td>One indexed <code>count</code> per alert type, run in parallel; zero counts are dropped.</td></tr>
+  <tr><td>TTL (2 months)</td><td>An <code>expires_at</code> field (written + 60 days) and an hourly task running <code>deleteMany({expires_at: {$lt: now}})</code> on each collection.</td></tr>
+  <tr><td>LOCAL_QUORUM</td><td><code>Consistency::Quorum</code> (cassango has a single data center).</td></tr>
+</table>
+
+<pre><code><span class="c">// keyset paging on notifications_by_date (simplified from notifications_by_date_dal.rs)</span>
+<span class="k">let</span> filter = <span class="k">match</span> after {
+    Some(after) =&gt; json!({<span class="s">"pk"</span>: {<span class="s">"$in"</span>: partition_keys}, <span class="s">"sort_key"</span>: {<span class="s">"$gt"</span>: after}}),
+    None =&gt; json!({<span class="s">"pk"</span>: {<span class="s">"$in"</span>: partition_keys}}),
+};
+<span class="k">let</span> result = collection.find(filter).sort(json!({<span class="s">"sort_key"</span>: 1})).limit(page_size).await?;
+<span class="k">let</span> has_more = result.matched &gt; result.docs.len();
+<span class="k">let</span> next_page = result.docs.last().filter(|_| has_more).map(|doc| BASE64.encode(&amp;doc.sort_key));</code></pre>
+
+<h2 class="newpage" id="errors">B. Error reference</h2>
+<table>
+  <tr><th style="width:12%">Status</th><th style="width:20%">Driver error</th><th>Meaning and what to do</th></tr>
+  <tr><td><code>400</code></td><td><code>BadRequest</code></td><td>Invalid filter, update operator, document or collection name. Fix the request.</td></tr>
+  <tr><td><code>404</code></td><td><code>NotFound</code> / <code>None</code></td><td>Document, index or node not found. Missing documents come back as <code>None</code> in the driver.</td></tr>
+  <tr><td><code>409</code></td><td><code>Conflict</code></td><td>A repair is already running, or a range movement is in progress (decommission, removenode, cleanup). Try again later.</td></tr>
+  <tr><td><code>503</code></td><td><code>Unavailable</code></td><td>Fewer replicas alive than the consistency level needs. Nothing was written. Retry, or use a lower consistency level.</td></tr>
+  <tr><td><code>504</code></td><td><code>Timeout</code></td><td>Enough replicas were alive but didn't acknowledge in time. The write may have been applied on some replicas. Retrying a put or delete is safe; retrying an <code>$inc</code> update may apply it twice.</td></tr>
+  <tr><td>—</td><td><code>Transport</code></td><td>No host could be reached, or the connection broke.</td></tr>
+  <tr><td>—</td><td><code>Serde</code></td><td>A stored document doesn't match your Rust type.</td></tr>
+  <tr><td>—</td><td><code>Partial</code></td><td><code>update_many</code> / <code>delete_many</code> refused because some nodes didn't answer the search.</td></tr>
+</table>
+<p>Shell exit codes: <code>0</code> success, <code>1</code> a statement failed, <code>2</code> bad command-line flags.</p>
+
+<h2 id="limits">C. Simplifications and limits</h2>
+<p>cassango is deliberately small. Compared with the real systems:</p>
+<ul>
+  <li><b>Membership.</b> A fixed-timeout failure detector instead of phi-accrual. Gossip sends the full state, not digests.</li>
+  <li><b>Storage.</b> Size-tiered compaction only. No block cache (the OS page cache does that job), no compression, no write throttling
+  if flushes fall behind. Values are stored as JSON text, not a binary format like BSON.</li>
+  <li><b>Hints</b> are kept in memory only, so they're lost if the coordinator restarts. Repair covers that.</li>
+  <li><b>Repair</b> rescans a replica's whole dataset on every run. There's no incremental repair, and a repair response holds all the
+  entries of the differing leaves at once.</li>
+  <li><b>Range movements</b> copy from every live replica rather than one source. That keeps the newest data but moves up to RF times as
+  much. Tokens come from the node id, so you can't choose or move them, and there's no "replace a dead node" shortcut: use removenode,
+  then join a fresh node. A removed node that comes back with its old data directory rejoins with stale data, so wipe it first.</li>
+  <li><b>Queries.</b> <code>find</code> always asks every node (indexes are local, not global). Sorting and limits happen on the coordinator after
+  all matches are gathered. There are no compound indexes and no index-backed sorting.</li>
+  <li><b>Writes.</b> <code>update</code> is read-modify-write and not atomic under concurrent updaters. <code>updateMany</code>/<code>deleteMany</code> are loops.
+  Inserts are upserts: a duplicate <code>_id</code> overwrites.</li>
+  <li><b>Security.</b> Client and node-to-node traffic is plain HTTP/JSON with no authentication or TLS. Run it on a trusted network.</li>
+  <li><b>No databases or namespaces</b> beyond collections, and no transactions.</li>
+</ul>
+</body>
+</html>
