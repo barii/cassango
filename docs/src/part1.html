@@ -527,7 +527,7 @@ curl -XPOST localhost:7003/collections/users/find -H 'content-type: application/
   "filter": {"addr.city": "Leeds", "age": {"$gte": 30}},
   "sort": {"age": -1}, "skip": 0, "limit": 10, "explain": true }'
 <span class="c"># {"docs":[...],"matched":1,"partial":false,"explain":{"node1":{"index":null,"examined":4,...},...}}</span></code></pre>
-<p>Errors come back as <code>{"error": "..."}</code> with status <code>400</code>, <code>404</code>, <code>409</code>, <code>503</code> or <code>504</code>. Appendix B lists them all.</p>
+<p>Errors come back as <code>{"error": "..."}</code> with status <code>400</code>, <code>404</code>, <code>409</code>, <code>503</code> or <code>504</code>. Appendix A lists them all.</p>
 
 <h2 id="operating">9. Running a cluster</h2>
 
